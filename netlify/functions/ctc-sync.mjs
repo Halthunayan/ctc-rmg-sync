@@ -157,16 +157,14 @@ export default async (req) => {
         cityid: hv("hdfCity"), tendertypeid: hv("hdfTenderType"), tenderstatusid: hv("hdfstatus"),
         rbbontype: hv("hdfRbbon"), companyid: hv("hdfCompanyId") });
       const API = "https://www.ctckw.com/api/HomePage/GetValue";
-      const qs = params.toString();
-      const i0 = firstPage.indexOf("/api/HomePage/GetValue");
-      const fullCall = firstPage.slice(Math.max(0,i0-90), i0+1150).replace(/\s+/g," ");
-      const tryReq = async (url, method, body, ct) => { try {
-        const r = await fetch(url, { method, headers:{ Cookie:j.hdr(), "User-Agent":UA, "X-Requested-With":"XMLHttpRequest", Referer:"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11", Accept:"application/json, text/javascript, */*; q=0.01", ...(ct?{"Content-Type":ct}:{}) }, body });
-        const t = await r.text(); return { status:r.status, len:t.length, sample:t.slice(0,220) };
-      } catch(e){ return { error:String(e) }; } };
-      const diag = { loginOk:true, lastMaxId, fullCall,
-        postQuery:     await tryReq(API+"?"+qs, "POST"),
-        postQueryList: await tryReq(API+"?"+qs, "POST", "[]", "application/json") };
+      const p = new URLSearchParams({ id:"1",
+        catidvalue: hv("hdfCatid"), buyerid: hv("hdfbuyers"), ClassificationID: hv("hdfTenderClassificationID"),
+        cityid: hv("hdfCity"), tendertypeid: hv("hdfTenderType"), tenderstatusid: hv("hdfstatus"),
+        rbbontype: hv("hdfRbbon"), companyid: hv("hdfCompanyId"), sortbyid: hv("hdfSortby"),
+        tendernameid: hv("hdfTenderName"), IDFrom:"0", IDTo:"50", User: hv("hdnUser"), startDate:"", endDate:"" });
+      const r = await fetch(API+"?"+p.toString(), { headers:{ Cookie:j.hdr(), "User-Agent":UA, "X-Requested-With":"XMLHttpRequest", Accept:"application/json, text/javascript, */*; q=0.01", Referer:"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11" } });
+      const t = await r.text();
+      const diag = { loginOk:true, lastMaxId, params:Object.fromEntries(p), apiStatus:r.status, apiLen:t.length, apiSample:t.slice(0,800) };
       return new Response(JSON.stringify({ ok:true, probe:diag }, null, 2), {headers:{"Content-Type":"application/json"}});
     }
 
