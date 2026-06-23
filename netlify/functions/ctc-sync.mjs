@@ -151,15 +151,16 @@ export default async (req) => {
     // PROBE (?selftest=1): lean, fast diagnostics — login + parseRows + find the
     // AJAX data endpoint the client-rendered results page calls. No write/email.
     if (new URL(req.url).searchParams.get("selftest") === "1") {
-      const all = (re,max=15) => { const out=[]; let m; const g=new RegExp(re.source,"gi");
-        while((m=g.exec(firstPage)) && out.length<max){ out.push(m[0].slice(0,130)); if(m.index===g.lastIndex) g.lastIndex++; } return out; };
-      const ctx = (needle,b=280,a=520,max=3) => { const out=[]; let i=-1,n=0;
-        while((i=firstPage.indexOf(needle,i+1))>=0 && n<max){ out.push(firstPage.slice(Math.max(0,i-b),i+a).replace(/\s+/g," ")); n++; } return out; };
+      const hv = (sfx) => { const m = firstPage.match(new RegExp('<input[^>]*ctl00_ContentPlaceHolder1_'+sfx+'[^>]*>','i')); if(!m) return ""; const v=m[0].match(/value="([^"]*)"/); return v?v[1]:""; };
+      const params = new URLSearchParams({ id:"1",
+        catidvalue: hv("hdfCatid"), buyerid: hv("hdfbuyers"), ClassificationID: hv("hdfTenderClassificationID"),
+        cityid: hv("hdfCity"), tendertypeid: hv("hdfTenderType"), tenderstatusid: hv("hdfstatus"),
+        rbbontype: hv("hdfRbbon"), companyid: hv("hdfCompanyId") });
+      const apiResp = await get(j, "https://www.ctckw.com/api/HomePage/GetValue?"+params.toString());
+      const apiText = await apiResp.text();
       const diag = { loginOk:true, lastMaxId, htmlLen:firstPage.length, pageRowCount:rows.length,
-        apiPaths:     all(/\/api\/[A-Za-z0-9_\/]{2,40}/),
-        getValueCtx:  ctx("/api/HomePage/GetValue", 300, 560, 3),
-        templateCtx:  ctx("tdc_id=", 380, 120, 1),
-      };
+        params: Object.fromEntries(params),
+        apiStatus: apiResp.status, apiLen: apiText.length, apiSample: apiText.slice(0,800) };
       return new Response(JSON.stringify({ ok:true, probe:diag }, null, 2), {headers:{"Content-Type":"application/json"}});
     }
 
