@@ -148,34 +148,19 @@ export default async (req) => {
     let rows = parseRows(firstPage);
     // (pagination across pages would iterate __doPostBack; page 1 = newest, enough for a daily delta)
 
-    // SELFTEST (?selftest=1): exercise scrape + enrich + write + Resend on demand,
-    // using a synthetic medical record so the write/email branches actually fire.
+    // PROBE (?selftest=1): lean, fast diagnostics — login + parseRows + find the
+    // AJAX data endpoint the client-rendered results page calls. No write/email.
     if (new URL(req.url).searchParams.get("selftest") === "1") {
-      const diag = { loginOk:true, lastMaxId, pageRowCount: rows.length,
-        sampleRows: rows.slice(0,6).map(r=>({ id:r.id, title:(r.title||"").slice(0,46), post:r.post, dead:r.dead })) };
-      diag.htmlLen = firstPage.length;
-      const snip = (re,b=70,a=230) => { const m = firstPage.match(re); return m ? firstPage.slice(Math.max(0,m.index-b), m.index+a).replace(/\s+/g," ") : null; };
-      diag.ajax = {
-        urlProp:    snip(/url\s*:\s*["'][^"']+\.(aspx|asmx|ashx|json)[^"']*["']/i),
-        asmx:       snip(/[A-Za-z0-9_\/.]+\.asmx[A-Za-z\/_]*/i),
-        ashx:       snip(/[A-Za-z0-9_\/.]+\.ashx[A-Za-z\/_?=&]*/i),
-        pageMethod: snip(/(GetAllTender|GetTender|LoadTender|BindTender|SearchTender|FillTender|getData|LoadData|GetData)[A-Za-z]*/i),
-        ajaxCall:   snip(/\$\.(ajax|post|getJSON|get)\s*\(/i, 20, 280),
+      const all = (re,max=12) => { const out=[]; let m; const g=new RegExp(re.source,"gi");
+        while((m=g.exec(firstPage)) && out.length<max){ out.push(m[0].slice(0,130)); } return out; };
+      const diag = { loginOk:true, lastMaxId, htmlLen:firstPage.length, pageRowCount:rows.length,
+        urls:        all(/url\s*:\s*["'][^"']{3,100}["']/),
+        pageMethods: all(/[A-Za-z0-9_]+\.aspx\/[A-Za-z]+/),
+        asmx:        all(/[A-Za-z0-9_\/.]+\.asmx[A-Za-z\/_]*/),
+        ashx:        all(/[A-Za-z0-9_\/.]+\.ashx[A-Za-z0-9\/_?=&]*/),
+        dataFns:     all(/(GetAllTender|GetTender|LoadTender|BindTender|SearchTender|FillTender|GetData|LoadData|BindData|GetList|FillGrid)[A-Za-z]*/),
       };
-      if (rows.length) { try { const d = await enrich(j, rows[0].id);
-        diag.enrichSample = { id:rows[0].id, ref:d.ref, type:d.type, entity:(d.entity||"").slice(0,40), title:(d.title||"").slice(0,46), price:d.price, deadline:d.dead };
-      } catch(e){ diag.enrichSample = { error:String(e) }; } }
-      const testRec = { nashraaId:"CTC-SELFTEST", refId:"SELFTEST", publisher:"Ministry of Health - SELF TEST (safe to delete)",
-        type:"Practice", summary:"SELFTEST — اختبار مناقصة طبية (please delete)", description:"Self-test record — safe to delete",
-        sector:"Medical", subSector:"Medical Consumables", postDate:"2026-06-23", deadline:"2026-07-31",
-        status:"New", mainSector:"Health", price:"", insurance:"", hasOpeningBids:"No", _ctcId:"SELFTEST", _src:"selftest" };
-      const wr = await fbPatch("tenders", { "CTC-SELFTEST": testRec });
-      await fbPut("tenders_version", Date.now());
-      diag.nodeWriteStatus = wr.status;
-      const er = await sendEmail([testRec]);
-      diag.emailStatus = er.status;
-      diag.emailResponse = (await er.text()).slice(0,300);
-      return new Response(JSON.stringify({ ok:true, selftest:diag }, null, 2), {headers:{"Content-Type":"application/json"}});
+      return new Response(JSON.stringify({ ok:true, probe:diag }, null, 2), {headers:{"Content-Type":"application/json"}});
     }
 
     // 2) new = id > lastMaxId, medically relevant, not a false positive
