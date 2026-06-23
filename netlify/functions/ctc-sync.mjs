@@ -36,28 +36,31 @@ const get  = (j,u)=> fetch(u,{headers:{Cookie:j.hdr(),"User-Agent":UA}});
 
 // ---- CTC HTTP login (ASP.NET WebForms) ------------------------------------
 async function ctcLogin(j){
-  let r = await fetch("https://www.ctckw.com/UserLogin.aspx",{headers:{"User-Agent":UA}}); j.take(r);
+  // CTC login form (verified live 2026-06): email field = txtPinCode1,
+  // password = txtPinCode2; the "دخول" button is an <a> firing
+  // __doPostBack('ctl00$ContentPlaceHolder1$btnLogin',''). No client-side
+  // hashing/encryption, so plain values are accepted.
+  const LOGIN = "https://www.ctckw.com/UserLogin.aspx?lang=ar";
+  let r = await fetch(LOGIN,{headers:{"User-Agent":UA}}); j.take(r);
   const html = await r.text();
   const f = {};
+  // carry every hidden field (order-independent: name/value matched separately)
   for (const m of html.matchAll(/<input[^>]*type="hidden"[^>]*>/gi)){
     const n=(m[0].match(/name="([^"]+)"/)||[])[1]; const v=(m[0].match(/value="([^"]*)"/)||[])[1]||"";
     if(n) f[n]=v;
   }
-  const user=(html.match(/<input[^>]*type="text"[^>]*name="([^"]+)"/i)||[])[1];
-  const pass=(html.match(/<input[^>]*type="password"[^>]*name="([^"]+)"/i)||[])[1];
-  const btn = html.match(/<input[^>]*type="submit"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/i)
-           || html.match(/<input[^>]*name="([^"]+)"[^>]*type="submit"[^>]*value="([^"]*)"/i);
-  if(!user||!pass) throw new Error("CTC login fields not found (form may have changed)");
-  f[user]=process.env.CTC_USER; f[pass]=process.env.CTC_PASS;
-  if(btn) f[btn[1]]=btn[2];
-  let r2 = await fetch("https://www.ctckw.com/UserLogin.aspx",{method:"POST",redirect:"manual",
+  f["__EVENTTARGET"]="ctl00$ContentPlaceHolder1$btnLogin";
+  f["__EVENTARGUMENT"]="";
+  f["ctl00$ContentPlaceHolder1$txtPinCode1"]=process.env.CTC_USER;
+  f["ctl00$ContentPlaceHolder1$txtPinCode2"]=process.env.CTC_PASS;
+  let r2 = await fetch(LOGIN,{method:"POST",redirect:"manual",
     headers:{"Content-Type":"application/x-www-form-urlencoded",Cookie:j.hdr(),"User-Agent":UA},
     body:new URLSearchParams(f).toString()}); j.take(r2);
-  // verify
+  // verify: a logged-in TendersSearch page must NOT contain the login field
   let chk = await get(j,"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11");
   const t = await chk.text();
-  if(/UserLogin\.aspx|تسجيل الدخول/i.test(chk.url)|| /Access Denied/i.test(t)) throw new Error("CTC login failed");
-  return t; // first page of the medical category
+  if(/txtPinCode2/i.test(t) || /UserLogin\.aspx/i.test(chk.url)) throw new Error("CTC login failed (still on login page)");
+  return t; // first page of the medical category (logged in)
 }
 
 // ---- parse a TendersSearch results page -----------------------------------
