@@ -63,23 +63,29 @@ async function ctcLogin(j){
   return t; // first page of the medical category (logged in)
 }
 
-// ---- parse a TendersSearch results page -----------------------------------
-function parseRows(html){
-  const rows=[]; const seen=new Set();
-  // crude row split around each TenderDetails link
-  const re=/tdc_id=(\d+)[^]*?(?=tdc_id=\d+|$)/g; let m;
-  for(const lm of html.matchAll(/TenderDetails\.aspx\?tdc_id=(\d+)/gi)){ /* anchor pass below */ }
-  // Title + meta live in the block following each detail link; parse the whole page text.
-  const text = html.replace(/<[^>]+>/g," ").replace(/&nbsp;/g," ").replace(/\s+/g," ");
-  for(const lm of html.matchAll(/href="TenderDetails\.aspx\?tdc_id=(\d+)"[^>]*>([^<]{6,})</gi)){
-    const id=lm[1]; if(seen.has(id))continue; seen.add(id);
-    // find dates near this id in the flattened text
-    const around = text.slice(Math.max(0,text.indexOf("CTC-ID "+id)-10), (text.indexOf("CTC-ID "+id)||0)+260);
-    const post=(around.match(/تاريخ النشر\s*([\d\/]+)/)||[])[1]||"";
-    const dead=(around.match(/الموعد النهائي\s*([\d\/]+)/)||[])[1]||"";
-    rows.push({ id, title:lm[2].trim(), post, dead });
-  }
-  return rows;
+// ---- fetch tender rows via the page's own JSON API -------------------------
+// The results page is CLIENT-rendered: it GETs /api/HomePage/GetValue with all
+// the hidden-field filters and renders the JSON. We replicate that call exactly.
+const hidVal = (page,sfx) => { const m = page.match(new RegExp('<input[^>]*ctl00_ContentPlaceHolder1_'+sfx+'[^>]*>','i')); if(!m) return ""; const v=m[0].match(/value="([^"]*)"/); return v?v[1]:""; };
+async function fetchTenders(j, page){
+  const p = new URLSearchParams({ id:"1",
+    catidvalue: hidVal(page,"hdfCatid")||"11", buyerid: hidVal(page,"hdfbuyers"),
+    ClassificationID: hidVal(page,"hdfTenderClassificationID"), cityid: hidVal(page,"hdfCity"),
+    tendertypeid: hidVal(page,"hdfTenderType"), tenderstatusid: hidVal(page,"hdfstatus"),
+    rbbontype: hidVal(page,"hdfRbbon"), companyid: hidVal(page,"hdfCompanyId"),
+    sortbyid: hidVal(page,"hdfSortby"), tendernameid: hidVal(page,"hdfTenderName"),
+    IDFrom:"0", IDTo:"200", User: hidVal(page,"hdnUser"), startDate:"", endDate:"" });
+  const r = await fetch("https://www.ctckw.com/api/HomePage/GetValue?"+p.toString(),
+    { headers:{ Cookie:j.hdr(), "User-Agent":UA, "X-Requested-With":"XMLHttpRequest",
+                Accept:"application/json, text/javascript, */*; q=0.01",
+                Referer:"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11" } });
+  if(!r.ok) throw new Error("CTC API HTTP "+r.status);
+  const arr = await r.json();
+  return (Array.isArray(arr)?arr:[]).map(o => ({
+    id: String(o.tdc_id||""), title: (o.tnd_name||"").trim(), entity: (o.ttp_name||"").trim(),
+    post: o.tnd_publish_date||"", dead: o.tnd_buy_tender_date||"",
+    type: o.tnd_tcs_id||"", status: o.tnd_sts||"", subcat: String(o.tnc_cat_id||""),
+  })).filter(r => r.id);
 }
 const iso = (d)=>{ const m=String(d||"").match(/(\d{2})\/(\d{2})\/(\d{4})/); return m?`${m[3]}-${m[2]}-${m[1]}`:""; };
 
@@ -144,46 +150,37 @@ export default async (req) => {
 
     const lastMaxId = Number((await fbGet("pipeline/lastMaxId")) || 0);
 
-    // 1) medical category, paginated (page 1 already fetched)
-    let rows = parseRows(firstPage);
-    // (pagination across pages would iterate __doPostBack; page 1 = newest, enough for a daily delta)
+    // 1) fetch the medical-category (CategoryID 11) tender list from the JSON API
+    const rows = await fetchTenders(j, firstPage);
+    log.push("api rows="+rows.length);
+    const isMedical = (r) => { const b = `${r.title} ${r.entity}`; return MED.test(b) && !NOTMED.test(b); };
 
-    // PROBE (?selftest=1): lean, fast diagnostics — login + parseRows + find the
-    // AJAX data endpoint the client-rendered results page calls. No write/email.
+    // SELFTEST (?selftest=1): read-only — show API rows + how the filter classifies
+    // recent items. No write/email, so it stays fast and side-effect free.
     if (new URL(req.url).searchParams.get("selftest") === "1") {
-      const hv = (sfx) => { const m = firstPage.match(new RegExp('<input[^>]*ctl00_ContentPlaceHolder1_'+sfx+'[^>]*>','i')); if(!m) return ""; const v=m[0].match(/value="([^"]*)"/); return v?v[1]:""; };
-      const params = new URLSearchParams({ id:"1",
-        catidvalue: hv("hdfCatid"), buyerid: hv("hdfbuyers"), ClassificationID: hv("hdfTenderClassificationID"),
-        cityid: hv("hdfCity"), tendertypeid: hv("hdfTenderType"), tenderstatusid: hv("hdfstatus"),
-        rbbontype: hv("hdfRbbon"), companyid: hv("hdfCompanyId") });
-      const API = "https://www.ctckw.com/api/HomePage/GetValue";
-      const p = new URLSearchParams({ id:"1",
-        catidvalue: hv("hdfCatid"), buyerid: hv("hdfbuyers"), ClassificationID: hv("hdfTenderClassificationID"),
-        cityid: hv("hdfCity"), tendertypeid: hv("hdfTenderType"), tenderstatusid: hv("hdfstatus"),
-        rbbontype: hv("hdfRbbon"), companyid: hv("hdfCompanyId"), sortbyid: hv("hdfSortby"),
-        tendernameid: hv("hdfTenderName"), IDFrom:"0", IDTo:"50", User: hv("hdnUser"), startDate:"", endDate:"" });
-      const r = await fetch(API+"?"+p.toString(), { headers:{ Cookie:j.hdr(), "User-Agent":UA, "X-Requested-With":"XMLHttpRequest", Accept:"application/json, text/javascript, */*; q=0.01", Referer:"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11" } });
-      const t = await r.text();
-      const diag = { loginOk:true, lastMaxId, params:Object.fromEntries(p), apiStatus:r.status, apiLen:t.length, apiSample:t.slice(0,800) };
-      return new Response(JSON.stringify({ ok:true, probe:diag }, null, 2), {headers:{"Content-Type":"application/json"}});
+      const recent = rows.filter(r => Number(r.id) > 259300).slice(0,40)
+        .map(r => ({ id:r.id, medical:isMedical(r), subcat:r.subcat,
+                     title:r.title.slice(0,44), entity:r.entity.slice(0,28), post:r.post, type:r.type }));
+      return new Response(JSON.stringify({ ok:true, selftest:{ loginOk:true, lastMaxId,
+        apiRows:rows.length, newestId:rows[0]?.id, medicalShown:recent.filter(c=>c.medical).length,
+        sample:recent } }, null, 2), {headers:{"Content-Type":"application/json"}});
     }
 
     // 2) new = id > lastMaxId, medically relevant, not a false positive
-    let fresh = rows.filter(r => Number(r.id) > lastMaxId);
+    const fresh = rows.filter(r => Number(r.id) > lastMaxId && isMedical(r));
 
-    // 3) enrich + normalize
+    // 3) enrich (best-effort: price/bond/ref) + normalize to RMG schema
     const records = [];
     for (const r of fresh) {
-      const d = await enrich(j, r.id);
-      const blob = `${r.title} ${d.title} ${d.entity}`;
-      if (!MED.test(blob) || NOTMED.test(blob)) continue;     // keep only real medical
+      let d = {};
+      try { d = await enrich(j, r.id); } catch {}
       records.push({
-        nashraaId: "CTC-"+r.id, refId: d.ref, publisher: "Ministry of Health - "+(d.entity||""),
-        type: typeEN(d.type), summary: d.title||r.title,
+        nashraaId: "CTC-"+r.id, refId: d.ref||"", publisher: "Ministry of Health - "+(r.entity||""),
+        type: typeEN(r.type), summary: r.title,
         description: "Medical / healthcare procurement — Kuwait (CTC)",
         sector: "Medical", subSector: "Medical Consumables",
-        postDate: iso(d.post||r.post), deadline: iso(d.dead||r.dead),
-        status: d.status||"New", mainSector: "Health",
+        postDate: iso(r.post), deadline: iso(r.dead),
+        status: r.status||"New", mainSector: "Health",
         price: d.price||"", insurance: d.bond||"", hasOpeningBids: "No",
         _ctcId: r.id, _src: "ctc",
       });
