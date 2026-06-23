@@ -158,15 +158,15 @@ export default async (req) => {
         rbbontype: hv("hdfRbbon"), companyid: hv("hdfCompanyId") });
       const API = "https://www.ctckw.com/api/HomePage/GetValue";
       const qs = params.toString();
-      const tryReq = async (method, body, ct) => { try {
-        const r = await fetch(method==="GET" ? API+"?"+qs : API, { method,
-          headers:{ Cookie:j.hdr(), "User-Agent":UA, "X-Requested-With":"XMLHttpRequest", Referer:"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11", ...(ct?{"Content-Type":ct}:{}) }, body });
-        const t = await r.text(); return { status:r.status, len:t.length, sample:t.slice(0,340) };
+      const i0 = firstPage.indexOf("/api/HomePage/GetValue");
+      const fullCall = firstPage.slice(Math.max(0,i0-90), i0+1150).replace(/\s+/g," ");
+      const tryReq = async (url, method, body, ct) => { try {
+        const r = await fetch(url, { method, headers:{ Cookie:j.hdr(), "User-Agent":UA, "X-Requested-With":"XMLHttpRequest", Referer:"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11", Accept:"application/json, text/javascript, */*; q=0.01", ...(ct?{"Content-Type":ct}:{}) }, body });
+        const t = await r.text(); return { status:r.status, len:t.length, sample:t.slice(0,220) };
       } catch(e){ return { error:String(e) }; } };
-      const diag = { loginOk:true, lastMaxId, params:Object.fromEntries(params),
-        getAjax:  await tryReq("GET"),
-        postForm: await tryReq("POST", qs, "application/x-www-form-urlencoded"),
-        postJson: await tryReq("POST", JSON.stringify(Object.fromEntries(params)), "application/json") };
+      const diag = { loginOk:true, lastMaxId, fullCall,
+        postQuery:     await tryReq(API+"?"+qs, "POST"),
+        postQueryList: await tryReq(API+"?"+qs, "POST", "[]", "application/json") };
       return new Response(JSON.stringify({ ok:true, probe:diag }, null, 2), {headers:{"Content-Type":"application/json"}});
     }
 
