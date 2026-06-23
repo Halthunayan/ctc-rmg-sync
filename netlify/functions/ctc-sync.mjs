@@ -105,6 +105,33 @@ const MED = /طب|صحة|صحي|مستشفى|مستوصف|مركز صحي|رعا
 const NOTMED = /بيطر|البطاريات|الإطارات|التربة|الخرسانة|مواد البناء|عطور|تجميل|مأكولات|كافتيريا|بقالة/;
 const typeEN = (a)=>({ "ممارسة":"Practice","مناقصة":"Tender","مزايدة":"Auction","مزاد":"Auction","استدراج عروض":"RFQ","خدمات استشارية":"Consulting","تأهيل":"Prequalification","استثمار":"Investment" }[String(a).trim()]||a||"Practice");
 
+// ---- bilingual digest email (Resend) --------------------------------------
+function buildEmail(records){
+  const card = (t)=>`<div style="border:1px solid #e2e6ee;border-radius:8px;padding:12px 14px;margin:10px 0;background:#fafbfd">
+    <div dir="rtl" style="font-weight:bold;font-size:15px;color:#1f3864">${t.summary}</div>
+    <div style="font-size:12px;color:#374151;line-height:1.7">🏛️ ${t.publisher}<br>🧾 ${t.type} · 🆔 ${t.nashraaId}<br>📅 ${t.postDate} · ⏰ ${t.deadline}</div>
+    <div style="margin-top:8px">
+      <a href="https://www.ctckw.com/TenderDetails.aspx?tdc_id=${t._ctcId}" style="display:inline-block;background:#2E5496;color:#fff;text-decoration:none;padding:7px 12px;border-radius:6px;font-size:12px;font-weight:bold;margin-right:6px">عرض في CTC ↗ / View on CTC</a>
+      <a href="https://rmg-tenders.netlify.app/?search=${t.nashraaId}" style="display:inline-block;background:#2f8f4e;color:#fff;text-decoration:none;padding:7px 12px;border-radius:6px;font-size:12px;font-weight:bold">فتح في RMG ↗ / Open in RMG</a>
+    </div></div>`;
+  const html = `<div style="font-family:Tahoma,Arial,sans-serif;max-width:640px">
+    <div style="background:#1f3864;color:#fff;padding:16px 18px;border-radius:8px">
+      <div dir="rtl" style="font-size:18px;font-weight:bold">مناقصات طبية جديدة من CTC</div>
+      <div style="font-size:14px;font-weight:bold">New CTC Medical Tenders — ${records.length} new</div>
+      <div style="font-size:12px;opacity:.85">${new Date().toISOString().slice(0,10)}</div></div>
+    <div style="margin:14px 0"><a href="https://rmg-tenders.netlify.app" style="display:inline-block;background:#2f8f4e;color:#fff;text-decoration:none;padding:8px 14px;border-radius:6px;font-weight:bold">📂 Open all in RMG</a></div>
+    ${records.map(card).join("")}
+    <div style="color:#9ca3af;font-size:11px;margin-top:14px;border-top:1px solid #eee;padding-top:10px">Automated daily digest · CTC → RMG · source ctckw.com</div></div>`;
+  const subject = `CTC Medical Tenders — ${new Date().toISOString().slice(0,10)} (${records.length} new) | مناقصات طبية`;
+  return { subject, html };
+}
+async function sendEmail(records){
+  const { subject, html } = buildEmail(records);
+  return fetch("https://api.resend.com/emails",{method:"POST",
+    headers:{Authorization:`Bearer ${process.env.RESEND_KEY}`,"Content-Type":"application/json"},
+    body:JSON.stringify({from:EMAIL_FROM,to:EMAIL_TO,subject,html})});
+}
+
 export default async (req) => {
   const log = [];
   try {
@@ -120,6 +147,27 @@ export default async (req) => {
     // 1) medical category, paginated (page 1 already fetched)
     let rows = parseRows(firstPage);
     // (pagination across pages would iterate __doPostBack; page 1 = newest, enough for a daily delta)
+
+    // SELFTEST (?selftest=1): exercise scrape + enrich + write + Resend on demand,
+    // using a synthetic medical record so the write/email branches actually fire.
+    if (new URL(req.url).searchParams.get("selftest") === "1") {
+      const diag = { loginOk:true, lastMaxId, pageRowCount: rows.length,
+        sampleRows: rows.slice(0,6).map(r=>({ id:r.id, title:(r.title||"").slice(0,46), post:r.post, dead:r.dead })) };
+      if (rows.length) { try { const d = await enrich(j, rows[0].id);
+        diag.enrichSample = { id:rows[0].id, ref:d.ref, type:d.type, entity:(d.entity||"").slice(0,40), title:(d.title||"").slice(0,46), price:d.price, deadline:d.dead };
+      } catch(e){ diag.enrichSample = { error:String(e) }; } }
+      const testRec = { nashraaId:"CTC-SELFTEST", refId:"SELFTEST", publisher:"Ministry of Health - SELF TEST (safe to delete)",
+        type:"Practice", summary:"SELFTEST — اختبار مناقصة طبية (please delete)", description:"Self-test record — safe to delete",
+        sector:"Medical", subSector:"Medical Consumables", postDate:"2026-06-23", deadline:"2026-07-31",
+        status:"New", mainSector:"Health", price:"", insurance:"", hasOpeningBids:"No", _ctcId:"SELFTEST", _src:"selftest" };
+      const wr = await fbPatch("tenders", { "CTC-SELFTEST": testRec });
+      await fbPut("tenders_version", Date.now());
+      diag.nodeWriteStatus = wr.status;
+      const er = await sendEmail([testRec]);
+      diag.emailStatus = er.status;
+      diag.emailResponse = (await er.text()).slice(0,300);
+      return new Response(JSON.stringify({ ok:true, selftest:diag }, null, 2), {headers:{"Content-Type":"application/json"}});
+    }
 
     // 2) new = id > lastMaxId, medically relevant, not a false positive
     let fresh = rows.filter(r => Number(r.id) > lastMaxId);
@@ -156,24 +204,7 @@ export default async (req) => {
 
     // 5) email digest via Resend
     if (records.length) {
-      const card = (t)=>`<div style="border:1px solid #e2e6ee;border-radius:8px;padding:12px 14px;margin:10px 0;background:#fafbfd">
-        <div dir="rtl" style="font-weight:bold;font-size:15px;color:#1f3864">${t.summary}</div>
-        <div style="font-size:12px;color:#374151;line-height:1.7">🏛️ ${t.publisher}<br>🧾 ${t.type} · 🆔 ${t.nashraaId}<br>📅 ${t.postDate} · ⏰ ${t.deadline}</div>
-        <div style="margin-top:8px">
-          <a href="https://www.ctckw.com/TenderDetails.aspx?tdc_id=${t._ctcId}" style="display:inline-block;background:#2E5496;color:#fff;text-decoration:none;padding:7px 12px;border-radius:6px;font-size:12px;font-weight:bold;margin-right:6px">عرض في CTC ↗ / View on CTC</a>
-          <a href="https://rmg-tenders.netlify.app/?search=${t.nashraaId}" style="display:inline-block;background:#2f8f4e;color:#fff;text-decoration:none;padding:7px 12px;border-radius:6px;font-size:12px;font-weight:bold">فتح في RMG ↗ / Open in RMG</a>
-        </div></div>`;
-      const html = `<div style="font-family:Tahoma,Arial,sans-serif;max-width:640px">
-        <div style="background:#1f3864;color:#fff;padding:16px 18px;border-radius:8px">
-          <div dir="rtl" style="font-size:18px;font-weight:bold">مناقصات طبية جديدة من CTC</div>
-          <div style="font-size:14px;font-weight:bold">New CTC Medical Tenders — ${records.length} new</div>
-          <div style="font-size:12px;opacity:.85">${new Date().toISOString().slice(0,10)}</div></div>
-        <div style="margin:14px 0"><a href="https://rmg-tenders.netlify.app" style="display:inline-block;background:#2f8f4e;color:#fff;text-decoration:none;padding:8px 14px;border-radius:6px;font-weight:bold">📂 Open all in RMG</a></div>
-        ${records.map(card).join("")}
-        <div style="color:#9ca3af;font-size:11px;margin-top:14px;border-top:1px solid #eee;padding-top:10px">Automated daily digest · CTC → RMG · source ctckw.com</div></div>`;
-      const er = await fetch("https://api.resend.com/emails",{method:"POST",
-        headers:{Authorization:`Bearer ${process.env.RESEND_KEY}`,"Content-Type":"application/json"},
-        body:JSON.stringify({from:EMAIL_FROM,to:EMAIL_TO,subject:`CTC Medical Tenders — ${new Date().toISOString().slice(0,10)} (${records.length} new) | مناقصات طبية`,html})});
+      const er = await sendEmail(records);
       log.push("email "+er.status);
     } else { log.push("no new medical — no email"); }
 
