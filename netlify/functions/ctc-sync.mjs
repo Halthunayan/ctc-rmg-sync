@@ -154,9 +154,14 @@ export default async (req) => {
       const diag = { loginOk:true, lastMaxId, pageRowCount: rows.length,
         sampleRows: rows.slice(0,6).map(r=>({ id:r.id, title:(r.title||"").slice(0,46), post:r.post, dead:r.dead })) };
       diag.htmlLen = firstPage.length;
-      diag.markers = { tdc_id: firstPage.includes("tdc_id"), TenderDetails: firstPage.includes("TenderDetails"), CTCID: firstPage.includes("CTC-ID"), aspxLink: firstPage.includes(".aspx?") };
-      const _di = firstPage.search(/TenderDetails|tdc_id/i);
-      diag.linkSnippet = _di>=0 ? firstPage.slice(Math.max(0,_di-140), _di+180).replace(/\s+/g," ") : firstPage.slice(0,300).replace(/\s+/g," ");
+      const snip = (re,b=70,a=230) => { const m = firstPage.match(re); return m ? firstPage.slice(Math.max(0,m.index-b), m.index+a).replace(/\s+/g," ") : null; };
+      diag.ajax = {
+        urlProp:    snip(/url\s*:\s*["'][^"']+\.(aspx|asmx|ashx|json)[^"']*["']/i),
+        asmx:       snip(/[A-Za-z0-9_\/.]+\.asmx[A-Za-z\/_]*/i),
+        ashx:       snip(/[A-Za-z0-9_\/.]+\.ashx[A-Za-z\/_?=&]*/i),
+        pageMethod: snip(/(GetAllTender|GetTender|LoadTender|BindTender|SearchTender|FillTender|getData|LoadData|GetData)[A-Za-z]*/i),
+        ajaxCall:   snip(/\$\.(ajax|post|getJSON|get)\s*\(/i, 20, 280),
+      };
       if (rows.length) { try { const d = await enrich(j, rows[0].id);
         diag.enrichSample = { id:rows[0].id, ref:d.ref, type:d.type, entity:(d.entity||"").slice(0,40), title:(d.title||"").slice(0,46), price:d.price, deadline:d.dead };
       } catch(e){ diag.enrichSample = { error:String(e) }; } }
