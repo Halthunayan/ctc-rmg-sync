@@ -151,14 +151,14 @@ export default async (req) => {
     // PROBE (?selftest=1): lean, fast diagnostics — login + parseRows + find the
     // AJAX data endpoint the client-rendered results page calls. No write/email.
     if (new URL(req.url).searchParams.get("selftest") === "1") {
-      const all = (re,max=12) => { const out=[]; let m; const g=new RegExp(re.source,"gi");
-        while((m=g.exec(firstPage)) && out.length<max){ out.push(m[0].slice(0,130)); } return out; };
+      const all = (re,max=15) => { const out=[]; let m; const g=new RegExp(re.source,"gi");
+        while((m=g.exec(firstPage)) && out.length<max){ out.push(m[0].slice(0,130)); if(m.index===g.lastIndex) g.lastIndex++; } return out; };
       const diag = { loginOk:true, lastMaxId, htmlLen:firstPage.length, pageRowCount:rows.length,
-        urls:        all(/url\s*:\s*["'][^"']{3,100}["']/),
-        pageMethods: all(/[A-Za-z0-9_]+\.aspx\/[A-Za-z]+/),
-        asmx:        all(/[A-Za-z0-9_\/.]+\.asmx[A-Za-z\/_]*/),
-        ashx:        all(/[A-Za-z0-9_\/.]+\.ashx[A-Za-z0-9\/_?=&]*/),
-        dataFns:     all(/(GetAllTender|GetTender|LoadTender|BindTender|SearchTender|FillTender|GetData|LoadData|BindData|GetList|FillGrid)[A-Za-z]*/),
+        urls:        all(/url\s*:\s*["'][^"']{3,100}["']/),       // negated class — backtracking-safe
+        aspxRefs:    all(/[\w./-]{0,40}\.aspx\/\w+/),             // bounded {0,40} — safe
+        asmxRefs:    all(/[\w./-]{0,40}\.asmx\b/),
+        ashxRefs:    all(/[\w./-]{0,40}\.ashx\b/),
+        dataFns:     all(/\b(Get|Load|Bind|Fill|Search)(All)?(Tender|Data|List|Grid|Result)s?\b/),
       };
       return new Response(JSON.stringify({ ok:true, probe:diag }, null, 2), {headers:{"Content-Type":"application/json"}});
     }
