@@ -153,12 +153,12 @@ export default async (req) => {
     if (new URL(req.url).searchParams.get("selftest") === "1") {
       const all = (re,max=15) => { const out=[]; let m; const g=new RegExp(re.source,"gi");
         while((m=g.exec(firstPage)) && out.length<max){ out.push(m[0].slice(0,130)); if(m.index===g.lastIndex) g.lastIndex++; } return out; };
+      const ctx = (needle,b=280,a=520,max=3) => { const out=[]; let i=-1,n=0;
+        while((i=firstPage.indexOf(needle,i+1))>=0 && n<max){ out.push(firstPage.slice(Math.max(0,i-b),i+a).replace(/\s+/g," ")); n++; } return out; };
       const diag = { loginOk:true, lastMaxId, htmlLen:firstPage.length, pageRowCount:rows.length,
-        urls:        all(/url\s*:\s*["'][^"']{3,100}["']/),       // negated class — backtracking-safe
-        aspxRefs:    all(/[\w./-]{0,40}\.aspx\/\w+/),             // bounded {0,40} — safe
-        asmxRefs:    all(/[\w./-]{0,40}\.asmx\b/),
-        ashxRefs:    all(/[\w./-]{0,40}\.ashx\b/),
-        dataFns:     all(/\b(Get|Load|Bind|Fill|Search)(All)?(Tender|Data|List|Grid|Result)s?\b/),
+        apiPaths:     all(/\/api\/[A-Za-z0-9_\/]{2,40}/),
+        getValueCtx:  ctx("/api/HomePage/GetValue", 300, 560, 3),
+        templateCtx:  ctx("tdc_id=", 380, 120, 1),
       };
       return new Response(JSON.stringify({ ok:true, probe:diag }, null, 2), {headers:{"Content-Type":"application/json"}});
     }
