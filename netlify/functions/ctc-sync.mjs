@@ -110,6 +110,7 @@ async function enrich(j,id){
 const MED = /طب|صحة|صحي|مستشفى|مستوصف|مركز صحي|رعاية صحية|عيادة|طبي|طبية|الطب|أسنان|صيدل|دواء|أدوية|محاليل مخبرية|مستهلكات طبية|أشعة|جراح|مرضى|تمريض|سريري|اكلينيكي|طوارئ طبية|إسعاف|وزارة الصحة|الصحة العامة/;
 const NOTMED = /بيطر|البطاريات|الإطارات|التربة|الخرسانة|مواد البناء|عطور|تجميل|مأكولات|كافتيريا|بقالة/;
 const typeEN = (a)=>({ "ممارسة":"Practice","مناقصة":"Tender","مزايدة":"Auction","مزاد":"Auction","استدراج عروض":"RFQ","خدمات استشارية":"Consulting","تأهيل":"Prequalification","استثمار":"Investment" }[String(a).trim()]||a||"Practice");
+const statusEN = (s)=>({ "جديد":"New","ساري":"Open","ساري المفعول":"Open","قائم":"Open","منتهي":"Closed","مغلق":"Closed","مقفل":"Closed","ملغي":"Cancelled","ملغى":"Cancelled","معلق":"On Hold","مؤجل":"Postponed","تحت الدراسة":"Under Review" }[String(s).trim()]||(s||"New"));
 
 // ---- bilingual digest email (Resend) --------------------------------------
 function buildEmail(records){
@@ -155,17 +156,6 @@ export default async (req) => {
     log.push("api rows="+rows.length);
     const isMedical = (r) => { const b = `${r.title} ${r.entity}`; return MED.test(b) && !NOTMED.test(b); };
 
-    // SELFTEST (?selftest=1): read-only — show API rows + how the filter classifies
-    // recent items. No write/email, so it stays fast and side-effect free.
-    if (new URL(req.url).searchParams.get("selftest") === "1") {
-      const recent = rows.filter(r => Number(r.id) > 259300).slice(0,40)
-        .map(r => ({ id:r.id, medical:isMedical(r), subcat:r.subcat,
-                     title:r.title.slice(0,44), entity:r.entity.slice(0,28), post:r.post, type:r.type }));
-      return new Response(JSON.stringify({ ok:true, selftest:{ loginOk:true, lastMaxId,
-        apiRows:rows.length, newestId:rows[0]?.id, medicalShown:recent.filter(c=>c.medical).length,
-        sample:recent } }, null, 2), {headers:{"Content-Type":"application/json"}});
-    }
-
     // 2) new = id > lastMaxId, medically relevant, not a false positive
     const fresh = rows.filter(r => Number(r.id) > lastMaxId && isMedical(r));
 
@@ -180,12 +170,22 @@ export default async (req) => {
         description: "Medical / healthcare procurement — Kuwait (CTC)",
         sector: "Medical", subSector: "Medical Consumables",
         postDate: iso(r.post), deadline: iso(r.dead),
-        status: r.status||"New", mainSector: "Health",
+        status: statusEN(r.status), mainSector: "Health",
         price: d.price||"", insurance: d.bond||"", hasOpeningBids: "No",
         _ctcId: r.id, _src: "ctc",
       });
     }
     log.push(`fresh=${fresh.length} medical=${records.length}`);
+
+    // GUARD against a concurrent double-fire (Netlify may deliver a scheduled
+    // invocation more than once): re-read the high-water mark; if another run
+    // already advanced it past our items, it wrote + emailed these — skip ours.
+    // (Per-tender keys already dedupe the data; this avoids a duplicate email.)
+    if (records.length) {
+      const nowMax = Number((await fbGet("pipeline/lastMaxId")) || 0);
+      const ourMax = Math.max(...records.map(t=>Number(t._ctcId)));
+      if (nowMax >= ourMax) { log.push("skip: concurrent run already processed"); records.length = 0; }
+    }
 
     // 4) write PER-TENDER nodes + bump version
     if (records.length) {
