@@ -184,14 +184,21 @@ export default async (req) => {
     const batch = freshAll.slice(0, BATCH);
     console.log("[ctc-sync] freshAll=", freshAll.length, "processing=", batch.length);
 
-    // enrich (best-effort) + normalize — PARALLEL, small concurrency cap
+    // enrich (best-effort) + normalize — PARALLEL, small concurrency cap.
+    // Enrichment (per-tender TenderDetails fetch) can HANG on CTC's side, and the
+    // AbortController timeout does not reliably cancel it in this runtime — that
+    // hang (Promise.all never resolving) is what stalled the pipeline for a week.
+    // So each enrich is raced against a hard wall-clock timer that RESOLVES to {}:
+    // even if the underlying fetch hangs, the run proceeds to write + email.
+    const enrichSafe = (id) => Promise.race([
+      enrich(j, id).catch(e => { console.log("[ctc-sync] enrich fail", id, String(e)); return {}; }),
+      new Promise(res => setTimeout(() => res({}), 5000)),
+    ]);
     const records = [];
     for (let i=0; i<batch.length; i+=CONC){
-      const recs = await Promise.all(batch.slice(i,i+CONC).map(async r => {
-        let d={}; try{ d = await enrich(j, r.id); }catch(e){ console.log("[ctc-sync] enrich fail", r.id, String(e)); }
-        return toRecord(r, d);
-      }));
+      const recs = await Promise.all(batch.slice(i,i+CONC).map(async r => toRecord(r, await enrichSafe(r.id))));
       records.push(...recs);
+      console.log("[ctc-sync] enriched", Math.min(i+CONC,batch.length), "/", batch.length, "t=", Date.now()-t0, "ms");
     }
     log.push(`freshAll=${freshAll.length} batch=${records.length}`);
     console.log("[ctc-sync] batch records=", records.length, "elapsed=", Date.now()-t0, "ms");
