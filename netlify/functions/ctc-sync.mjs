@@ -25,9 +25,8 @@ const EMAIL_TO   = (process.env.EMAIL_TO || "ryangdougherty@gmail.com,hamadswat@
 // The week-long stall was caused by an UNBOUNDED, sequential enrich loop over a
 // growing backlog: it ran 60s and was killed before it could write/email, so
 // lastMaxId never advanced and the backlog only grew. Fix = cap + parallelize.
-const CTC_T = 6000;   // per-request timeout for ctckw.com calls
-const BATCH = 20;     // max tenders processed per run (oldest first → always progresses)
-const CONC  = 5;      // parallel enrich requests
+const CTC_T = 8000;   // per-request timeout for ctckw.com calls
+const BATCH = 50;     // max tenders written per run (oldest first → always progresses)
 
 // fetch with a hard timeout — a hung CTC request must abort, not hang the run.
 const fetchT = (url, opts={}, ms=8000) => {
@@ -184,22 +183,14 @@ export default async (req) => {
     const batch = freshAll.slice(0, BATCH);
     console.log("[ctc-sync] freshAll=", freshAll.length, "processing=", batch.length);
 
-    // enrich (best-effort) + normalize — PARALLEL, small concurrency cap.
-    // Enrichment (per-tender TenderDetails fetch) can HANG on CTC's side, and the
-    // AbortController timeout does not reliably cancel it in this runtime — that
-    // hang (Promise.all never resolving) is what stalled the pipeline for a week.
-    // So each enrich is raced against a hard wall-clock timer that RESOLVES to {}:
-    // even if the underlying fetch hangs, the run proceeds to write + email.
-    const enrichSafe = (id) => Promise.race([
-      enrich(j, id).catch(e => { console.log("[ctc-sync] enrich fail", id, String(e)); return {}; }),
-      new Promise(res => setTimeout(() => res({}), 5000)),
-    ]);
-    const records = [];
-    for (let i=0; i<batch.length; i+=CONC){
-      const recs = await Promise.all(batch.slice(i,i+CONC).map(async r => toRecord(r, await enrichSafe(r.id))));
-      records.push(...recs);
-      console.log("[ctc-sync] enriched", Math.min(i+CONC,batch.length), "/", batch.length, "t=", Date.now()-t0, "ms");
-    }
+    // Build records DIRECTLY from the list API rows. Per-tender enrichment
+    // (price/bond/refId via TenderDetails.aspx) is DISABLED: those detail fetches
+    // hang on CTC's side and their AbortController timeout doesn't cancel in this
+    // runtime, so the enrich loop never resolved — that stalled the pipeline for a
+    // week. Everything essential (title/dates/status/publisher) is already in the
+    // list API. Enrichment can be re-added later as a separate bounded job.
+    const records = batch.map(r => toRecord(r, {}));
+    console.log("[ctc-sync] records (no enrich)=", records.length, "t=", Date.now()-t0, "ms");
     log.push(`freshAll=${freshAll.length} batch=${records.length}`);
     console.log("[ctc-sync] batch records=", records.length, "elapsed=", Date.now()-t0, "ms");
 
