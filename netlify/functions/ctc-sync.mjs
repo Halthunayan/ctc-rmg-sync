@@ -21,8 +21,15 @@ const UA    = "Mozilla/5.0 (compatible; RMG-CTC-Sync/1.0)";
 const EMAIL_FROM = process.env.EMAIL_FROM || "onboarding@resend.dev";
 const EMAIL_TO   = (process.env.EMAIL_TO || "ryangdougherty@gmail.com,hamadswat@gmail.com,ryandougherty@jhu.edu").split(",").map(s=>s.trim());
 
-// fetch with a hard timeout — a hung CTC request used to hang the whole run
-// silently (no data, no email). Now it aborts and throws a clear, LOGGED error.
+// Per-run limits — keep the whole run well under Netlify's 60s function timeout.
+// The week-long stall was caused by an UNBOUNDED, sequential enrich loop over a
+// growing backlog: it ran 60s and was killed before it could write/email, so
+// lastMaxId never advanced and the backlog only grew. Fix = cap + parallelize.
+const CTC_T = 6000;   // per-request timeout for ctckw.com calls
+const BATCH = 20;     // max tenders processed per run (oldest first → always progresses)
+const CONC  = 5;      // parallel enrich requests
+
+// fetch with a hard timeout — a hung CTC request must abort, not hang the run.
 const fetchT = (url, opts={}, ms=8000) => {
   const ac = new AbortController();
   const to = setTimeout(()=>ac.abort(new Error(`timeout ${ms}ms`)), ms);
@@ -40,46 +47,37 @@ function jar(){ const c={}; return {
   take(res){ const sc = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
     (sc||[]).forEach(s=>{ const m=s.match(/^([^=]+)=([^;]*)/); if(m) c[m[1]]=m[2]; }); }
 };}
-const get  = (j,u)=> fetchT(u,{headers:{Cookie:j.hdr(),"User-Agent":UA}},8000);
+const get  = (j,u)=> fetchT(u,{headers:{Cookie:j.hdr(),"User-Agent":UA}},CTC_T);
 
 // ---- CTC HTTP login (ASP.NET WebForms) ------------------------------------
 async function ctcLogin(j){
-  // CTC login form (verified live 2026-06): email field = txtPinCode1,
-  // password = txtPinCode2; the "دخول" button is an <a> firing
-  // __doPostBack('ctl00$ContentPlaceHolder1$btnLogin',''). No client-side
-  // hashing/encryption, so plain values are accepted.
   const LOGIN = "https://www.ctckw.com/UserLogin.aspx?lang=ar";
-  let r = await fetchT(LOGIN,{headers:{"User-Agent":UA}},8000); j.take(r);
+  let r = await fetchT(LOGIN,{headers:{"User-Agent":UA}},CTC_T); j.take(r);
   console.log("[ctc-sync] login GET", r.status);
   const html = await r.text();
   const f = {};
-  // carry every hidden field (order-independent: name/value matched separately)
   for (const m of html.matchAll(/<input[^>]*type="hidden"[^>]*>/gi)){
     const n=(m[0].match(/name="([^"]+)"/)||[])[1]; const v=(m[0].match(/value="([^"]*)"/)||[])[1]||"";
     if(n) f[n]=v;
   }
-  const hasLoginForm = /txtPinCode2/i.test(html);
-  console.log("[ctc-sync] login page hiddenFields=", Object.keys(f).length, "hasPwField=", hasLoginForm);
+  console.log("[ctc-sync] login hiddenFields=", Object.keys(f).length, "hasPwField=", /txtPinCode2/i.test(html));
   f["__EVENTTARGET"]="ctl00$ContentPlaceHolder1$btnLogin";
   f["__EVENTARGUMENT"]="";
   f["ctl00$ContentPlaceHolder1$txtPinCode1"]=process.env.CTC_USER;
   f["ctl00$ContentPlaceHolder1$txtPinCode2"]=process.env.CTC_PASS;
   let r2 = await fetchT(LOGIN,{method:"POST",redirect:"manual",
     headers:{"Content-Type":"application/x-www-form-urlencoded",Cookie:j.hdr(),"User-Agent":UA},
-    body:new URLSearchParams(f).toString()},8000); j.take(r2);
-  console.log("[ctc-sync] login POST", r2.status, "->", r2.headers.get("location")||"(no redirect)");
-  // verify: a logged-in TendersSearch page must NOT contain the login field
+    body:new URLSearchParams(f).toString()},CTC_T); j.take(r2);
+  console.log("[ctc-sync] login POST", r2.status);
   let chk = await get(j,"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11");
   const t = await chk.text();
   const stillLogin = /txtPinCode2/i.test(t) || /UserLogin\.aspx/i.test(chk.url);
-  console.log("[ctc-sync] verify TendersSearch", chk.status, "stillOnLogin=", stillLogin, "len=", t.length);
+  console.log("[ctc-sync] verify", chk.status, "stillOnLogin=", stillLogin);
   if(stillLogin) throw new Error("CTC login failed (still on login page)");
-  return t; // first page of the medical category (logged in)
+  return t;
 }
 
 // ---- fetch tender rows via the page's own JSON API -------------------------
-// The results page is CLIENT-rendered: it GETs /api/HomePage/GetValue with all
-// the hidden-field filters and renders the JSON. We replicate that call exactly.
 const hidVal = (page,sfx) => { const m = page.match(new RegExp('<input[^>]*ctl00_ContentPlaceHolder1_'+sfx+'[^>]*>','i')); if(!m) return ""; const v=m[0].match(/value="([^"]*)"/); return v?v[1]:""; };
 async function fetchTenders(j, page){
   const p = new URLSearchParams({ id:"1",
@@ -89,11 +87,10 @@ async function fetchTenders(j, page){
     rbbontype: hidVal(page,"hdfRbbon"), companyid: hidVal(page,"hdfCompanyId"),
     sortbyid: hidVal(page,"hdfSortby"), tendernameid: hidVal(page,"hdfTenderName"),
     IDFrom:"0", IDTo:"200", User: hidVal(page,"hdnUser"), startDate:"", endDate:"" });
-  console.log("[ctc-sync] api params catid=", hidVal(page,"hdfCatid")||"11", "user=", hidVal(page,"hdnUser")?"set":"EMPTY");
   const r = await fetchT("https://www.ctckw.com/api/HomePage/GetValue?"+p.toString(),
     { headers:{ Cookie:j.hdr(), "User-Agent":UA, "X-Requested-With":"XMLHttpRequest",
                 Accept:"application/json, text/javascript, */*; q=0.01",
-                Referer:"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11" } }, 8000);
+                Referer:"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11" } }, CTC_T);
   console.log("[ctc-sync] api HTTP", r.status);
   if(!r.ok) throw new Error("CTC API HTTP "+r.status);
   const arr = await r.json();
@@ -110,17 +107,8 @@ async function enrich(j,id){
   let r = await get(j,`https://www.ctckw.com/TenderDetails.aspx?tdc_id=${id}`);
   const t = (await r.text()).replace(/<[^>]+>/g,"\n").replace(/&nbsp;/g," ");
   const g=(label)=>{ const m=t.match(new RegExp(label+"\\s*\\n?\\s*([^\\n]+)")); return m?m[1].trim():""; };
-  return {
-    ref:    g("الرقم"),
-    type:   g("نوع الاشعار"),
-    entity: g("الجهة الناشرة"),
-    post:   g("تاريخ الطرح"),
-    dead:   g("الموعد النهائي"),
-    status: g("الحالة"),
-    price:  g("السعر"),
-    bond:   g("التامين"),
-    title:  g("الموضوع"),
-  };
+  return { ref:g("الرقم"), type:g("نوع الاشعار"), entity:g("الجهة الناشرة"), post:g("تاريخ الطرح"),
+           dead:g("الموعد النهائي"), status:g("الحالة"), price:g("السعر"), bond:g("التامين"), title:g("الموضوع") };
 }
 
 const MED = /طب|صحة|صحي|مستشفى|مستوصف|مركز صحي|رعاية صحية|عيادة|طبي|طبية|الطب|أسنان|صيدل|دواء|أدوية|محاليل مخبرية|مستهلكات طبية|أشعة|جراح|مرضى|تمريض|سريري|اكلينيكي|طوارئ طبية|إسعاف|وزارة الصحة|الصحة العامة/;
@@ -155,12 +143,23 @@ async function sendEmail(records){
     body:JSON.stringify({from:EMAIL_FROM,to:EMAIL_TO,subject,html})},8000);
 }
 
+const toRecord = (r, d={}) => ({
+  nashraaId: "CTC-"+r.id, refId: d.ref||"", publisher: "Ministry of Health - "+(r.entity||""),
+  type: typeEN(r.type), summary: r.title,
+  description: "Medical / healthcare procurement — Kuwait (CTC)",
+  sector: "Medical", subSector: "Medical Consumables",
+  postDate: iso(r.post), deadline: iso(r.dead),
+  status: statusEN(r.status), mainSector: "Health",
+  price: d.price||"", insurance: d.bond||"", hasOpeningBids: "No",
+  _ctcId: r.id, _src: "ctc",
+});
+
 export default async (req) => {
   const log = [];
   const t0 = Date.now();
   try {
     if(!FB || !process.env.CTC_USER || !process.env.RESEND_KEY){
-      console.error("[ctc-sync] MISSING ENV", {FB:!!FB, CTC_USER:!!process.env.CTC_USER, RESEND_KEY:!!process.env.RESEND_KEY});
+      console.error("[ctc-sync] MISSING ENV");
       return new Response("Missing env (FIREBASE_URL / CTC_USER / RESEND_KEY)", {status:500});
     }
     console.log("[ctc-sync] === run start", new Date().toISOString());
@@ -172,65 +171,60 @@ export default async (req) => {
     const lastMaxId = Number((await fbGet("pipeline/lastMaxId")) || 0);
     console.log("[ctc-sync] lastMaxId=", lastMaxId);
 
-    // 1) fetch the medical-category (CategoryID 11) tender list from the JSON API
     const rows = await fetchTenders(j, firstPage);
+    const maxRowId = rows.reduce((m,r)=>Math.max(m,Number(r.id)||0),0);
     log.push("api rows="+rows.length);
-    console.log("[ctc-sync] rows=", rows.length, "maxRowId=", rows.reduce((m,r)=>Math.max(m,Number(r.id)||0),0));
+    console.log("[ctc-sync] rows=", rows.length, "maxRowId=", maxRowId);
     const isMedical = (r) => { const b = `${r.title} ${r.entity}`; return MED.test(b) && !NOTMED.test(b); };
 
-    // 2) new = id > lastMaxId, medically relevant, not a false positive
-    const fresh = rows.filter(r => Number(r.id) > lastMaxId && isMedical(r));
+    // new = id > lastMaxId & medical; OLDEST first so we always make progress,
+    // and CAP per run so the enrich loop can't exceed the 60s function limit.
+    const freshAll = rows.filter(r => Number(r.id) > lastMaxId && isMedical(r))
+                         .sort((a,b)=> Number(a.id) - Number(b.id));
+    const batch = freshAll.slice(0, BATCH);
+    console.log("[ctc-sync] freshAll=", freshAll.length, "processing=", batch.length);
 
-    // 3) enrich (best-effort: price/bond/ref) + normalize to RMG schema
+    // enrich (best-effort) + normalize — PARALLEL, small concurrency cap
     const records = [];
-    for (const r of fresh) {
-      let d = {};
-      try { d = await enrich(j, r.id); } catch(e){ console.log("[ctc-sync] enrich fail", r.id, String(e)); }
-      records.push({
-        nashraaId: "CTC-"+r.id, refId: d.ref||"", publisher: "Ministry of Health - "+(r.entity||""),
-        type: typeEN(r.type), summary: r.title,
-        description: "Medical / healthcare procurement — Kuwait (CTC)",
-        sector: "Medical", subSector: "Medical Consumables",
-        postDate: iso(r.post), deadline: iso(r.dead),
-        status: statusEN(r.status), mainSector: "Health",
-        price: d.price||"", insurance: d.bond||"", hasOpeningBids: "No",
-        _ctcId: r.id, _src: "ctc",
-      });
+    for (let i=0; i<batch.length; i+=CONC){
+      const recs = await Promise.all(batch.slice(i,i+CONC).map(async r => {
+        let d={}; try{ d = await enrich(j, r.id); }catch(e){ console.log("[ctc-sync] enrich fail", r.id, String(e)); }
+        return toRecord(r, d);
+      }));
+      records.push(...recs);
     }
-    log.push(`fresh=${fresh.length} medical=${records.length}`);
-    console.log("[ctc-sync] fresh=", fresh.length, "medical=", records.length);
+    log.push(`freshAll=${freshAll.length} batch=${records.length}`);
+    console.log("[ctc-sync] batch records=", records.length, "elapsed=", Date.now()-t0, "ms");
 
-    // GUARD against a concurrent double-fire (Netlify may deliver a scheduled
-    // invocation more than once): re-read the high-water mark; if another run
-    // already advanced it past our items, it wrote + emailed these — skip ours.
-    // (Per-tender keys already dedupe the data; this avoids a duplicate email.)
+    // guard against a concurrent double-fire (re-read high-water mark)
     if (records.length) {
       const nowMax = Number((await fbGet("pipeline/lastMaxId")) || 0);
       const ourMax = Math.max(...records.map(t=>Number(t._ctcId)));
-      if (nowMax >= ourMax) { log.push("skip: concurrent run already processed"); console.log("[ctc-sync] skip concurrent"); records.length = 0; }
+      if (nowMax >= ourMax) { log.push("skip: concurrent run"); console.log("[ctc-sync] skip concurrent"); records.length = 0; }
     }
 
-    // 4) write PER-TENDER nodes + bump version
+    // write PER-TENDER nodes + advance high-water mark to the max PROCESSED id
     if (records.length) {
       const patch = {};
       records.forEach(t => { patch[t.nashraaId] = t; });
-      await fbPatch("tenders", patch);                 // merge — never overwrites other tenders
+      await fbPatch("tenders", patch);
       await fbPut("tenders_version", Date.now());
       const newMax = Math.max(lastMaxId, ...records.map(t=>Number(t._ctcId)));
       await fbPut("pipeline/lastMaxId", newMax);
       await fbPatch("pipeline/runs", { [Date.now()]: { date:new Date().toISOString().slice(0,10), n:records.length } });
-      console.log("[ctc-sync] wrote", records.length, "newMax=", newMax);
+      console.log("[ctc-sync] wrote", records.length, "newMax=", newMax, "remaining=", freshAll.length-records.length);
     }
 
-    // 5) email digest via Resend
+    // email digest via Resend
     if (records.length) {
       const er = await sendEmail(records);
       log.push("email "+er.status);
       console.log("[ctc-sync] email HTTP", er.status);
     } else { log.push("no new medical — no email"); console.log("[ctc-sync] no new medical — no email"); }
 
-    console.log("[ctc-sync] === done in", Date.now()-t0, "ms", JSON.stringify(log));
-    return new Response(JSON.stringify({ok:true, log}), {headers:{"Content-Type":"application/json"}});
+    const remaining = Math.max(0, freshAll.length - records.length);
+    console.log("[ctc-sync] === done in", Date.now()-t0, "ms", JSON.stringify(log), "remaining=", remaining);
+    return new Response(JSON.stringify({ok:true, remaining, log}), {headers:{"Content-Type":"application/json"}});
   } catch (e) {
     console.error("[ctc-sync] ERROR after", Date.now()-t0, "ms:", String(e), "| log:", JSON.stringify(log));
     return new Response(JSON.stringify({ok:false, error:String(e), log}), {status:500, headers:{"Content-Type":"application/json"}});
