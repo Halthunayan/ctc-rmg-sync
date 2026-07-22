@@ -78,9 +78,9 @@ async function ctcLogin(j){
 
 // ---- fetch tender rows via the page's own JSON API -------------------------
 const hidVal = (page,sfx) => { const m = page.match(new RegExp('<input[^>]*ctl00_ContentPlaceHolder1_'+sfx+'[^>]*>','i')); if(!m) return ""; const v=m[0].match(/value="([^"]*)"/); return v?v[1]:""; };
-async function fetchTenders(j, page){
+async function fetchTenders(j, page, categoryId){
   const p = new URLSearchParams({ id:"1",
-    catidvalue: hidVal(page,"hdfCatid")||"11", buyerid: hidVal(page,"hdfbuyers"),
+    catidvalue: String(categoryId||"11"), buyerid: hidVal(page,"hdfbuyers"),
     ClassificationID: hidVal(page,"hdfTenderClassificationID"), cityid: hidVal(page,"hdfCity"),
     tendertypeid: hidVal(page,"hdfTenderType"), tenderstatusid: hidVal(page,"hdfstatus"),
     rbbontype: hidVal(page,"hdfRbbon"), companyid: hidVal(page,"hdfCompanyId"),
@@ -90,7 +90,7 @@ async function fetchTenders(j, page){
     { headers:{ Cookie:j.hdr(), "User-Agent":UA, "X-Requested-With":"XMLHttpRequest",
                 Accept:"application/json, text/javascript, */*; q=0.01",
                 Referer:"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11" } }, CTC_T);
-  console.log("[ctc-sync] api HTTP", r.status);
+  console.log("[ctc-sync] api cat="+String(categoryId||"11"), "HTTP", r.status);
   if(!r.ok) throw new Error("CTC API HTTP "+r.status);
   const arr = await r.json();
   return (Array.isArray(arr)?arr:[]).map(o => ({
@@ -110,7 +110,7 @@ async function enrich(j,id){
            dead:g("الموعد النهائي"), status:g("الحالة"), price:g("السعر"), bond:g("التامين"), title:g("الموضوع") };
 }
 
-const MED = /طب|صحة|صحي|مستشفى|مستوصف|مركز صحي|رعاية صحية|عيادة|طبي|طبية|الطب|أسنان|صيدل|دواء|أدوية|محاليل مخبرية|مستهلكات طبية|أشعة|جراح|مرضى|تمريض|سريري|اكلينيكي|طوارئ طبية|إسعاف|وزارة الصحة|الصحة العامة/;
+const MED = /طب|صحة|صحي|مستشفى|مستوصف|مركز صحي|رعاية صحية|عيادة|طبي|طبية|الطب|أسنان|صيدل|دواء|أدوية|محاليل مخبرية|مستهلكات طبية|أشعة|جراح|مرضى|تمريض|سريري|اكلينيكي|طوارئ طبية|إسعاف|وزارة الصحة|الصحة العامة|مجمع صحي|مرفق صحي|مجمع طبي|مرفق طبي|اورام|أورام|الطب النفسي|مختبر|مختبرات/;
 const NOTMED = /بيطر|البطاريات|الإطارات|التربة|الخرسانة|مواد البناء|عطور|تجميل|مأكولات|كافتيريا|بقالة/;
 const typeEN = (a)=>({ "ممارسة":"Practice","مناقصة":"Tender","مزايدة":"Auction","مزاد":"Auction","استدراج عروض":"RFQ","خدمات استشارية":"Consulting","تأهيل":"Prequalification","استثمار":"Investment" }[String(a).trim()]||a||"Practice");
 const statusEN = (s)=>({ "جديد":"New","ساري":"Open","ساري المفعول":"Open","قائم":"Open","منتهي":"Closed","مغلق":"Closed","مقفل":"Closed","ملغي":"Cancelled","ملغى":"Cancelled","معلق":"On Hold","مؤجل":"Postponed","تحت الدراسة":"Under Review" }[String(s).trim()]||(s||"New"));
@@ -170,8 +170,17 @@ export default async (req) => {
     const lastMaxId = Number((await fbGet("pipeline/lastMaxId")) || 0);
     console.log("[ctc-sync] lastMaxId=", lastMaxId);
 
-    const rows = await fetchTenders(j, firstPage);
+    // Fetch BOTH the Health category (11 — medical goods/lab) AND the Studies &
+    // Consultations category (35 — where medical-facility DESIGN & SUPERVISION
+    // tenders live). Merge + dedupe by id; the medical filter keeps only the
+    // health-related ones from category 35.
+    const rows11 = await fetchTenders(j, firstPage, "11");
+    const rows35 = await fetchTenders(j, firstPage, "35");
+    const byId = new Map();
+    [...rows11, ...rows35].forEach(r => { if(r.id && !byId.has(r.id)) byId.set(r.id, r); });
+    const rows = [...byId.values()];
     const maxRowId = rows.reduce((m,r)=>Math.max(m,Number(r.id)||0),0);
+    console.log("[ctc-sync] cat11=", rows11.length, "cat35=", rows35.length, "merged=", rows.length);
     log.push("api rows="+rows.length);
     console.log("[ctc-sync] rows=", rows.length, "maxRowId=", maxRowId);
     const isMedical = (r) => { const b = `${r.title} ${r.entity}`; return MED.test(b) && !NOTMED.test(b); };
@@ -219,6 +228,48 @@ export default async (req) => {
       log.push("email "+er.status);
       console.log("[ctc-sync] email HTTP", er.status);
     } else { log.push("no new medical — no email"); console.log("[ctc-sync] no new medical — no email"); }
+
+    // AUTO DEADLINE/STATUS REFRESH: CTC can extend a tender's deadline or change
+    // its status after we first stored it. Every run, compare CTC's CURRENT
+    // deadline/status (from the list API we already fetched) against what we hold
+    // for tenders we ALREADY track, and patch any that changed. Covers the
+    // ~200-most-recent per category (where active tenders live), and runs whether
+    // or not there were new tenders this run.
+    try {
+      const existing = (await fbGet("tenders")) || {};
+      const refreshPatch = {}; let refreshed = 0;
+      for (const r of rows) {
+        if (!isMedical(r)) continue;
+        const key = "CTC-" + r.id, ex = existing[key];
+        if (!ex) continue;                       // brand-new ones are handled by the write above
+        const nd = iso(r.dead), ns = statusEN(r.status);
+        let changed = false;
+        if (nd && ex.deadline !== nd) { refreshPatch[key+"/deadline"] = nd; changed = true; }
+        if (ns && ex.status   !== ns) { refreshPatch[key+"/status"]   = ns; changed = true; }
+        if (changed) refreshed++;
+      }
+      if (Object.keys(refreshPatch).length) { await fbPatch("tenders", refreshPatch); await fbPut("tenders_version", Date.now()); }
+      log.push("refreshed "+refreshed);
+      console.log("[ctc-sync] deadline/status refresh:", refreshed, "updated");
+    } catch(e) { console.log("[ctc-sync] refresh skipped:", String(e)); }
+
+    // best-effort enrichment (refId/price/bond) — runs AFTER write+email so it can
+    // NEVER stall the pipeline. Each TenderDetails fetch is raced against a 3.5s
+    // wall-clock timer (those fetches can hang on CTC's side); hung ones are
+    // abandoned. Kept small/gentle to avoid CTC rate-limiting. Patches only the
+    // enriched fields onto the already-written nodes via slash-path keys.
+    if (records.length) {
+      const cap = records.slice(0, 10), CONC = 3, patch = {};
+      const raceEnrich = (id) => Promise.race([ enrich(j,id).catch(()=>null), new Promise(r=>setTimeout(()=>r(null),3500)) ]);
+      let enriched = 0;
+      for (let i=0;i<cap.length;i+=CONC){
+        const res = await Promise.all(cap.slice(i,i+CONC).map(async t => ({t, d: await raceEnrich(t._ctcId)})));
+        res.forEach(({t,d}) => { if(d && (d.ref||d.price||d.bond)){ patch[t.nashraaId+"/refId"]=d.ref||""; patch[t.nashraaId+"/price"]=d.price||""; patch[t.nashraaId+"/insurance"]=d.bond||""; enriched++; } });
+      }
+      if (Object.keys(patch).length){ await fbPatch("tenders", patch); await fbPut("tenders_version", Date.now()); }
+      log.push("enriched "+enriched+"/"+cap.length);
+      console.log("[ctc-sync] enriched", enriched, "/", cap.length, "t=", Date.now()-t0, "ms");
+    }
 
     const remaining = Math.max(0, freshAll.length - records.length);
     console.log("[ctc-sync] === done in", Date.now()-t0, "ms", JSON.stringify(log), "remaining=", remaining);
