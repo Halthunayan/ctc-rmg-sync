@@ -204,11 +204,15 @@ export default async (req) => {
     // signature already exists in /tenders, so neither Firebase nor the email
     // digest ever contains duplicate cards.
     {
-      const _ex = (await fbGet("tenders")) || {};
-      const _sig = (t) => `${t.summary||''}|${t.deadline||''}|${t.publisher||''}`;
-      const _exSig = new Set(Object.values(_ex).map(_sig));
+      // Within-batch only: collapse the same practice re-listed under consecutive
+      // tdc_ids (identical title/deadline/publisher, e.g. 6LS216 ×4) so the email
+      // shows one card. refId is "" at insert (enrichment disabled) so it is a
+      // no-op here but kept for parity with the app signature. NOTE: no cross-
+      // history drop — matching an OLD tender's title must NOT hide a NEW distinct
+      // practice that happens to share a truncated title (6SU008 vs 6SU004).
+      const _sig = (t) => `${t.refId||''}|${t.summary||''}|${t.deadline||''}|${t.publisher||''}`;
       const _seen = new Set();
-      records = records.filter(t => { const s=_sig(t); if(_exSig.has(s)||_seen.has(s)) return false; _seen.add(s); return true; });
+      records = records.filter(t => { const s=_sig(t); if(_seen.has(s)) return false; _seen.add(s); return true; });
     }
     console.log("[ctc-sync] records (deduped)=", records.length, "t=", Date.now()-t0, "ms");
     log.push(`freshAll=${freshAll.length} batch=${records.length}`);
