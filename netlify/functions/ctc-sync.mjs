@@ -198,8 +198,19 @@ export default async (req) => {
     // runtime, so the enrich loop never resolved — that stalled the pipeline for a
     // week. Everything essential (title/dates/status/publisher) is already in the
     // list API. Enrichment can be re-added later as a separate bounded job.
-    const records = batch.map(r => toRecord(r, {}));
-    console.log("[ctc-sync] records (no enrich)=", records.length, "t=", Date.now()-t0, "ms");
+    let records = batch.map(r => toRecord(r, {}));
+    // DEDUPE: CTC lists one tender under multiple consecutive tdc_ids (identical
+    // title / deadline / publisher). Collapse within this batch AND drop any whose
+    // signature already exists in /tenders, so neither Firebase nor the email
+    // digest ever contains duplicate cards.
+    {
+      const _ex = (await fbGet("tenders")) || {};
+      const _sig = (t) => `${t.summary||''}|${t.deadline||''}|${t.publisher||''}`;
+      const _exSig = new Set(Object.values(_ex).map(_sig));
+      const _seen = new Set();
+      records = records.filter(t => { const s=_sig(t); if(_exSig.has(s)||_seen.has(s)) return false; _seen.add(s); return true; });
+    }
+    console.log("[ctc-sync] records (deduped)=", records.length, "t=", Date.now()-t0, "ms");
     log.push(`freshAll=${freshAll.length} batch=${records.length}`);
     console.log("[ctc-sync] batch records=", records.length, "elapsed=", Date.now()-t0, "ms");
 
