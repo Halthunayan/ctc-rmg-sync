@@ -107,13 +107,138 @@ async function enrich(j,id){
   const t = (await r.text()).replace(/<[^>]+>/g,"\n").replace(/&nbsp;/g," ");
   const g=(label)=>{ const m=t.match(new RegExp(label+"\\s*\\n?\\s*([^\\n]+)")); return m?m[1].trim():""; };
   return { ref:g("الرقم"), type:g("نوع الاشعار"), entity:g("الجهة الناشرة"), post:g("تاريخ الطرح"),
-           dead:g("الموعد النهائي"), status:g("الحالة"), price:g("السعر"), bond:g("التامين"), title:g("الموضوع") };
+           dead:g("الموعد النهائي"), status:g("الحالة"), price:g("السعر"), bond:g("التامين"), title:g("الموضوع"),
+           hasBids: /إجمالي العرض|اسم المقاول/.test(t) };
 }
 
 const MED = /طب|صحة|صحي|مستشفى|مستوصف|مركز صحي|رعاية صحية|عيادة|طبي|طبية|الطب|أسنان|صيدل|دواء|أدوية|محاليل مخبرية|مستهلكات طبية|أشعة|جراح|مرضى|تمريض|سريري|اكلينيكي|طوارئ طبية|إسعاف|وزارة الصحة|الصحة العامة|مجمع صحي|مرفق صحي|مجمع طبي|مرفق طبي|اورام|أورام|الطب النفسي|مختبر|مختبرات/;
 const NOTMED = /بيطر|البطاريات|الإطارات|التربة|الخرسانة|مواد البناء|عطور|تجميل|مأكولات|كافتيريا|بقالة/;
 const typeEN = (a)=>({ "ممارسة":"Practice","مناقصة":"Tender","مزايدة":"Auction","مزاد":"Auction","استدراج عروض":"RFQ","خدمات استشارية":"Consulting","تأهيل":"Prequalification","استثمار":"Investment" }[String(a).trim()]||a||"Practice");
 const statusEN = (s)=>({ "جديد":"New","ساري":"Open","ساري المفعول":"Open","قائم":"Open","منتهي":"Closed","مغلق":"Closed","مقفل":"Closed","ملغي":"Cancelled","ملغى":"Cancelled","معلق":"On Hold","مؤجل":"Postponed","تحت الدراسة":"Under Review" }[String(s).trim()]||(s||"New"));
+
+
+// ---- PDF text extraction (no dependency: Node's built-in zlib) --------------
+// CTC's MoH "QOT" quotation forms carry a real text layer. Content streams are
+// FlateDecode, so inflate each stream and pull the text-showing operators.
+// Deliberately NOT pdfjs-dist: a heavy import + parse would risk the 60s
+// function timeout that previously stalled this pipeline for a week.
+import zlib from "node:zlib";
+function pdfText(buf){
+  let out = "";
+  const bytes = Buffer.from(buf);
+  let i = 0;
+  while (true) {
+    const s = bytes.indexOf("stream", i); if (s < 0) break;
+    let a = s + 6; if (bytes[a] === 13) a++; if (bytes[a] === 10) a++;
+    const e = bytes.indexOf("endstream", a); if (e < 0) break;
+    i = e + 9;
+    let chunk = bytes.subarray(a, e);
+    try { chunk = zlib.inflateSync(chunk); } catch { continue; }   // not deflated → skip
+    const txt = chunk.toString("latin1");
+    // ( ... ) Tj   and   [ (..) -3 (..) ] TJ
+    const re = /\((?:\\.|[^\\()])*\)/g;
+    let m, seg = "";
+    while ((m = re.exec(txt))) {
+      seg += m[0].slice(1, -1).replace(/\\([()\\])/g, "$1").replace(/\\[rn]/g, " ");
+    }
+    if (seg.trim()) out += seg + "\n";
+    if (out.length > 60000) break;                                  // hard cap
+  }
+  return out;
+}
+
+// Parse an item schedule: English product line + unit + quantity.
+function pdfItems(text){
+  const UNIT = /\b(PCS|BOX|VIAL|PKT|SET|EACH|KIT|AMP|TAB|BTL|PACK|ROLL|BAG|TUBE)\b/i;
+  const items = [];
+  for (const raw of text.split(/\n+/)) {
+    const line = raw.replace(/\s+/g, " ").trim();
+    if (line.length < 12) continue;
+    const u = line.match(UNIT); if (!u) continue;
+    const q = line.match(/\b(\d{1,3}(?:,\d{3})+|\d{2,7})\b(?!.*\b\d{2,7}\b)/);
+    if (!q) continue;
+    const qty = Number(q[1].replace(/,/g, ""));
+    if (!qty || qty < 2) continue;                                  // 1 = lot placeholder
+    const desc = line.slice(0, u.index).replace(/[|,;:\s]+$/, "").trim();
+    if (desc.length < 6) continue;
+    items.push({ d: desc.slice(0, 160), u: u[1].toUpperCase(), q: qty });
+    if (items.length >= 40) break;
+  }
+  return items;
+}
+
+// ---- sub-sector classification (was hardcoded "Medical Consumables") -------
+const PHARM_EN = /\b(TABLET|CAPSULE|INJECTION|AMPOULE|VIAL|SYRUP|SUSPENSION|OINTMENT|INFUSION|VACCINE|INSULIN|MG|ML|IU)\b/i;
+const PHARM_AR = /(حبوب|حقن|كبسولات|أدوية|ادوية|دواء|لقاح|شراب|مرهم|محاليل وريدية|صيدل)/;
+const EQUIP_EN = /\b(MACHINE|SYSTEM|MONITOR|SCANNER|ANALYZER|ANALYSER|INSTRUMENT|DEVICE|CHAIR|BED|PUMP|VENTILATOR|MICROSCOPE|CENTRIFUGE|INCUBATOR|LASER|X-?RAY|ULTRASOUND|WHEEL ?CHAIR)\b/i;
+const EQUIP_AR = /(جهاز|أجهزة|اجهزة|معدات|ماكينة|تركيب)/;
+// Consumable accessories often contain an equipment noun ("MICROSCOPE cover
+// slide", "VENTILATOR tube"), so these markers are checked BEFORE the equipment
+// patterns — otherwise disposables get filed as capital equipment.
+const CONSUM_EN = /\b(SLIDE|SWAB|GAUZE|GLOVE|SYRINGE|NEEDLE|CATHETER|MASK|DRESSING|BANDAGE|TUBING|BAG|CONTAINER|WIPE|PAD|NAPKIN|APPLICATOR|TIP|COVER|FILTER|PIPETTE|REAGENT|CUVETTE|LANCET|ELECTRODE|DIAPER|SHEET|GOWN|DRAPE)\b/i;
+function subSectorFor(title, items){
+  const t = String(title || "");
+  const en = (items || []).map(i => i.d).join(" ");
+  // MoH titles routinely embed English product names inside Arabic text
+  // (e.g. "شراء WHEEL CHAIR BARIATRIC 60 CM"), so the English patterns must be
+  // tested against the title as well as the item schedule.
+  const all = `${t} ${en}`;
+  if (PHARM_EN.test(all) || PHARM_AR.test(t)) return "Pharmaceuticals";
+  if (CONSUM_EN.test(all)) return "Medical Consumables";
+  if (EQUIP_EN.test(all) || EQUIP_AR.test(t)) return "Medical Equipment";
+  return "Medical Consumables";
+}
+
+// ---- real description (was an identical placeholder on every tender) -------
+function describeTender(r, d = {}, items = []){
+  if (items.length){
+    const head = items.slice(0, 3).map(i => {
+      const qty = i.q ? ` (${i.q.toLocaleString()} ${i.u || ""})`.replace(/ \)$/, ")") : "";
+      return `${i.d}${qty}`;
+    }).join("; ");
+    const more = items.length > 3 ? ` … +${items.length - 3} more line items` : "";
+    return (head + more).slice(0, 400);
+  }
+  const bits = [];
+  if (r.type)   bits.push(typeEN(r.type));
+  if (r.entity) bits.push(r.entity);
+  const tail = bits.length ? ` — ${bits.join(" · ")}` : "";
+  const base = `${String(r.title || "").trim()}${tail}`.trim();
+  return (base || "Medical / healthcare procurement — Kuwait (CTC)").slice(0, 400);
+}
+
+
+// ---- attachments: fetch a tender's PDFs, ref-named one FIRST ---------------
+// Tenders whose item schedule is published attach a PDF whose filename contains
+// the tender ref (e.g. ...5DI073.pdf for ref 5DI073). Generic batch scans
+// (Doc1.pdf) are one-page adverts with no schedule, so try the ref-named file
+// first and stop as soon as items are found.
+async function pdfPass(j, id, ref){
+  const r = await get(j, `https://www.ctckw.com/TenderDetails.aspx?tdc_id=${id}`);
+  const html = await r.text();
+  const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf)["']/gi)].map(m => m[1]);
+  if (!hrefs.length) return [];
+  const key = String(ref || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  const score = (h) => {
+    const f = h.split("/").pop().replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    if (key && f.includes(key)) return 0;          // ref-named → best
+    if (/DOC\d+\.PDF$/i.test(h)) return 2;         // generic batch advert → worst
+    return 1;
+  };
+  hrefs.sort((a, b) => score(a) - score(b));
+  for (const h of hrefs.slice(0, 2)) {            // at most 2 PDFs per tender
+    const url = h.startsWith("http") ? h : `https://www.ctckw.com/${h.replace(/^\/+/, "")}`;
+    try {
+      const pr = await fetchT(url, { headers: { "User-Agent": UA } }, 5000);
+      if (!pr.ok) continue;
+      const buf = await pr.arrayBuffer();
+      if (buf.byteLength > 6e6) continue;          // skip very large scans
+      const items = pdfItems(pdfText(buf));
+      if (items.length) return items;
+    } catch { /* ignore this attachment */ }
+  }
+  return [];
+}
 
 // ---- bilingual digest email (Resend) --------------------------------------
 function buildEmail(records){
@@ -142,21 +267,89 @@ async function sendEmail(records){
     body:JSON.stringify({from:EMAIL_FROM,to:EMAIL_TO,subject,html})},8000);
 }
 
-const toRecord = (r, d={}) => ({
+const toRecord = (r, d={}, items=[]) => ({
   nashraaId: "CTC-"+r.id, refId: d.ref||"", publisher: "Ministry of Health - "+(r.entity||""),
   type: typeEN(r.type), summary: r.title,
-  description: "Medical / healthcare procurement — Kuwait (CTC)",
-  sector: "Medical", subSector: "Medical Consumables",
+  // Real, per-tender description. Built from the PDF item schedule when the PDF
+  // pass has run; otherwise from title + notice type + buying department. Never
+  // the same string on every record (the old placeholder made the app useless).
+  description: describeTender(r, d, items),
+  sector: "Medical", subSector: subSectorFor(r.title, items),
   postDate: iso(r.post), deadline: iso(r.dead),
   status: statusEN(r.status), mainSector: "Health",
-  price: d.price||"", insurance: d.bond||"", hasOpeningBids: "No",
+  price: d.price||"", insurance: d.bond||"",
+  hasOpeningBids: d.hasBids ? "Yes" : "No",
+  items: items.length ? items : null,
+  itemCount: items.length,
   _ctcId: r.id, _src: "ctc",
 });
+
+
+// ---- BACKFILL MODE ---------------------------------------------------------
+// Every tender written before this version carries an identical placeholder
+// description and subSector "Medical Consumables". Those fields can be rebuilt
+// entirely from data ALREADY in Firebase (summary / type / publisher) — no CTC
+// fetch, no external data, so it is fast and safe. Item schedules still need the
+// PDF pass, which the daily run chews through for new tenders.
+//
+// Trigger:  /.netlify/functions/ctc-sync?backfill=1[&limit=1500]
+// Resumable: cursor stored at pipeline/backfillCursor; re-invoke until done:true
+const PLACEHOLDER = "Medical / healthcare procurement — Kuwait (CTC)";
+async function runBackfill(limit){
+  const all = (await fbGet("tenders")) || {};
+  const keys = Object.keys(all).sort();
+  const cursor = String((await fbGet("pipeline/backfillCursor")) || "");
+  let start = 0;
+  if (cursor) { const i = keys.indexOf(cursor); start = i >= 0 ? i + 1 : 0; }
+
+  const patch = {};
+  let scanned = 0, fixedDesc = 0, fixedSub = 0, last = cursor;
+  for (let i = start; i < keys.length && scanned < limit; i++) {
+    const k = keys[i], t = all[k] || {};
+    scanned++; last = k;
+    const items = Array.isArray(t.items) ? t.items : [];
+    // description: replace the placeholder (or an empty/echoed-title value)
+    const needDesc = !t.description || t.description === PLACEHOLDER || t.description === t.summary;
+    if (needDesc) {
+      const d = describeTender({ title: t.summary, type: t.type, entity: (t.publisher || "").replace("Ministry of Health - ", "") }, {}, items);
+      if (d && d !== t.description) { patch[k + "/description"] = d; fixedDesc++; }
+    }
+    // subSector: recompute; only patch when it actually changes
+    const ss = subSectorFor(t.summary, items);
+    if (ss !== t.subSector) { patch[k + "/subSector"] = ss; fixedSub++; }
+  }
+  if (Object.keys(patch).length) {
+    await fbPatch("tenders", patch);
+    await fbPut("tenders_version", Date.now());
+  }
+  const done = (start + scanned) >= keys.length;
+  await fbPut("pipeline/backfillCursor", done ? "" : last);
+  return { total: keys.length, from: start, scanned, fixedDesc, fixedSub,
+           patched: Object.keys(patch).length, done };
+}
 
 export default async (req) => {
   const log = [];
   const t0 = Date.now();
   try {
+    // BACKFILL: repair descriptions/sub-sectors on already-stored tenders.
+    // Needs only FIREBASE_URL, so it runs even if CTC/Resend creds are absent.
+    try {
+      const u = new URL(req.url);
+      if (u.searchParams.get("backfill")) {
+        if (!FB) return new Response("Missing FIREBASE_URL", { status: 500 });
+        const limit = Math.min(Number(u.searchParams.get("limit")) || 1500, 4000);
+        const res = await runBackfill(limit);
+        console.log("[ctc-sync] backfill", JSON.stringify(res));
+        return new Response(JSON.stringify({ ok: true, mode: "backfill", ...res }),
+          { headers: { "Content-Type": "application/json" } });
+      }
+    } catch (e) {
+      console.error("[ctc-sync] backfill error:", String(e));
+      return new Response(JSON.stringify({ ok: false, mode: "backfill", error: String(e) }),
+        { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+
     if(!FB || !process.env.CTC_USER || !process.env.RESEND_KEY){
       console.error("[ctc-sync] MISSING ENV");
       return new Response("Missing env (FIREBASE_URL / CTC_USER / RESEND_KEY)", {status:500});
@@ -284,6 +477,38 @@ export default async (req) => {
       if (Object.keys(patch).length){ await fbPatch("tenders", patch); await fbPut("tenders_version", Date.now()); }
       log.push("enriched "+enriched+"/"+cap.length);
       console.log("[ctc-sync] enriched", enriched, "/", cap.length, "t=", Date.now()-t0, "ms");
+    }
+
+    // PDF PASS — read each new tender's attachment to recover the real item
+    // schedule, then upgrade description + subSector + items on the stored node.
+    // Runs LAST (after write + email) and is hard-capped, so a slow or hanging
+    // CTC attachment can never prevent the pipeline from writing or emailing —
+    // that failure mode stalled this pipeline for a week and must not return.
+    if (records.length) {
+      const PDF_CAP = 8, PDF_CONC = 2, patch = {};
+      const budgetLeft = () => 45000 - (Date.now() - t0);     // leave ~15s headroom
+      const racePdf = (id, ref) => Promise.race([
+        pdfPass(j, id, ref).catch(() => []),
+        new Promise(r => setTimeout(() => r([]), 6000)),
+      ]);
+      const cap = records.slice(0, PDF_CAP);
+      let withItems = 0, scanned = 0;
+      for (let i = 0; i < cap.length; i += PDF_CONC) {
+        if (budgetLeft() < 8000) { console.log("[ctc-sync] pdf pass: out of budget, stopping"); break; }
+        const res = await Promise.all(cap.slice(i, i + PDF_CONC).map(async t => ({ t, items: await racePdf(t._ctcId, t.refId) })));
+        res.forEach(({ t, items }) => {
+          scanned++;
+          if (!items.length) return;
+          withItems++;
+          patch[t.nashraaId + "/items"]       = items;
+          patch[t.nashraaId + "/itemCount"]   = items.length;
+          patch[t.nashraaId + "/description"] = describeTender({ title: t.summary }, {}, items);
+          patch[t.nashraaId + "/subSector"]   = subSectorFor(t.summary, items);
+        });
+      }
+      if (Object.keys(patch).length) { await fbPatch("tenders", patch); await fbPut("tenders_version", Date.now()); }
+      log.push(`pdf ${withItems}/${scanned}`);
+      console.log("[ctc-sync] pdf pass:", withItems, "of", scanned, "yielded items, t=", Date.now()-t0, "ms");
     }
 
     const remaining = Math.max(0, freshAll.length - records.length);
