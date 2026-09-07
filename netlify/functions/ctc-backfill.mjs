@@ -65,6 +65,136 @@ function describeTender(r, items = []) {
   return `${String(r.title || "").trim()}${tail}`.trim().slice(0, 400);
 }
 
+
+// ---- PDF MODE (?pdf=1) -----------------------------------------------------
+// Fills item schedules on tenders that have none, by logging in to CTC and
+// reading each tender's attachment. Bounded per invocation and resumable via
+// its own cursor, so it is re-invoked until {"done":true}. Kept separate from
+// the description backfill because it needs a CTC session and is far slower.
+import zlib from "node:zlib";
+const UA = "Mozilla/5.0 (compatible; RMG-CTC-Sync/1.0)";
+const CTC_T = 8000;
+
+function jar(){ const c={}; return {
+  hdr(){ return Object.entries(c).map(([k,v])=>`${k}=${v}`).join("; "); },
+  take(res){ const sc = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
+    (sc||[]).forEach(x=>{ const m=x.match(/^([^=]+)=([^;]*)/); if(m) c[m[1]]=m[2]; }); }
+};}
+const cget = (j,u)=> fetchT(u,{headers:{Cookie:j.hdr(),"User-Agent":UA}},CTC_T);
+
+async function ctcLogin(j){
+  const LOGIN = "https://www.ctckw.com/UserLogin.aspx?lang=ar";
+  let r = await fetchT(LOGIN,{headers:{"User-Agent":UA}},CTC_T); j.take(r);
+  const html = await r.text();
+  const f = {};
+  for (const m of html.matchAll(/<input[^>]*type="hidden"[^>]*>/gi)){
+    const n=(m[0].match(/name="([^"]+)"/)||[])[1]; const v=(m[0].match(/value="([^"]*)"/)||[])[1]||"";
+    if(n) f[n]=v;
+  }
+  f["__EVENTTARGET"]="ctl00$ContentPlaceHolder1$btnLogin";
+  f["__EVENTARGUMENT"]="";
+  f["ctl00$ContentPlaceHolder1$txtPinCode1"]=process.env.CTC_USER;
+  f["ctl00$ContentPlaceHolder1$txtPinCode2"]=process.env.CTC_PASS;
+  let r2 = await fetchT(LOGIN,{method:"POST",redirect:"manual",
+    headers:{"Content-Type":"application/x-www-form-urlencoded",Cookie:j.hdr(),"User-Agent":UA},
+    body:new URLSearchParams(f).toString()},CTC_T); j.take(r2);
+  const chk = await cget(j,"https://www.ctckw.com/TendersSearch.aspx?CategoryID=11");
+  const t = await chk.text();
+  if (/txtPinCode2/i.test(t) || /UserLogin\.aspx/i.test(chk.url)) throw new Error("CTC login failed");
+  return true;
+}
+
+function pdfText(buf){
+  let out=""; const bytes=Buffer.from(buf); let i=0;
+  while(true){
+    const st=bytes.indexOf("stream",i); if(st<0) break;
+    let a=st+6; if(bytes[a]===13)a++; if(bytes[a]===10)a++;
+    const e=bytes.indexOf("endstream",a); if(e<0) break;
+    i=e+9;
+    let chunk=bytes.subarray(a,e);
+    try{ chunk=zlib.inflateSync(chunk); }catch{ continue; }
+    const txt=chunk.toString("latin1");
+    const re=/\((?:\\.|[^\\()])*\)/g; let m, seg="";
+    while((m=re.exec(txt))) seg += m[0].slice(1,-1).replace(/\\([()\\])/g,"$1").replace(/\\[rn]/g," ");
+    if(seg.trim()) out += seg + "\n";
+    if(out.length>60000) break;
+  }
+  return out;
+}
+function pdfItems(text){
+  const UNIT=/\b(PCS|BOX|VIAL|PKT|SET|EACH|KIT|AMP|TAB|BTL|PACK|ROLL|BAG|TUBE)\b/i;
+  const items=[];
+  for(const raw of text.split(/\n+/)){
+    const line=raw.replace(/\s+/g," ").trim();
+    if(line.length<12) continue;
+    const u=line.match(UNIT); if(!u) continue;
+    const q=line.match(/\b(\d{1,3}(?:,\d{3})+|\d{2,7})\b(?!.*\b\d{2,7}\b)/); if(!q) continue;
+    const qty=Number(q[1].replace(/,/g,"")); if(!qty||qty<2) continue;
+    const d=line.slice(0,u.index).replace(/[|,;:\s]+$/,"").trim();
+    if(d.length<6) continue;
+    items.push({d:d.slice(0,160),u:u[1].toUpperCase(),q:qty});
+    if(items.length>=40) break;
+  }
+  return items;
+}
+async function pdfForTender(j,id,ref){
+  const r = await cget(j,`https://www.ctckw.com/TenderDetails.aspx?tdc_id=${id}`);
+  const html = await r.text();
+  const hrefs=[...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf)["']/gi)].map(m=>m[1]);
+  if(!hrefs.length) return [];
+  const key=String(ref||"").replace(/[^A-Za-z0-9]/g,"").toUpperCase();
+  const score=(h)=>{ const f=h.split("/").pop().replace(/[^A-Za-z0-9]/g,"").toUpperCase();
+    if(key&&f.includes(key)) return 0; if(/DOC\d+\.PDF$/i.test(h)) return 2; return 1; };
+  hrefs.sort((a,b)=>score(a)-score(b));
+  for(const h of hrefs.slice(0,2)){
+    const url=h.startsWith("http")?h:`https://www.ctckw.com/${h.replace(/^\/+/,"")}`;
+    try{
+      const pr=await fetchT(url,{headers:{Cookie:j.hdr(),"User-Agent":UA}},5000);
+      if(!pr.ok) continue;
+      const buf=await pr.arrayBuffer();
+      if(buf.byteLength>6e6) continue;
+      const items=pdfItems(pdfText(buf));
+      if(items.length) return items;
+    }catch{}
+  }
+  return [];
+}
+
+async function runPdfPass(limit, t0){
+  const all=(await fbGet("tenders"))||{};
+  const keys=Object.keys(all).sort();
+  const cursor=String((await fbGet("pipeline/pdfCursor"))||"");
+  let start=0; if(cursor){ const i=keys.indexOf(cursor); start=i>=0?i+1:0; }
+
+  const j=jar(); await ctcLogin(j);
+
+  const patch={}; let scanned=0, withItems=0, skipped=0, last=cursor;
+  const budget=()=> 22000-(Date.now()-t0);          // stay well inside the timeout
+  for(let i=start;i<keys.length&&scanned<limit;i++){
+    if(budget()<6000) break;
+    const k=keys[i], t=all[k]||{};
+    last=k;
+    if(Array.isArray(t.items)&&t.items.length){ skipped++; continue; }
+    scanned++;
+    const items=await Promise.race([
+      pdfForTender(j,t._ctcId,t.refId).catch(()=>[]),
+      new Promise(r=>setTimeout(()=>r([]),6000)),
+    ]);
+    if(!items.length) continue;
+    withItems++;
+    patch[k+"/items"]=items;
+    patch[k+"/itemCount"]=items.length;
+    patch[k+"/description"]=describeTender({title:t.summary,type:t.type,
+      entity:String(t.publisher||"").replace("Ministry of Health - ","")},items);
+    patch[k+"/subSector"]=subSectorFor(t.summary,items);
+  }
+  if(Object.keys(patch).length){ await fbPatch("tenders",patch); await fbPut("tenders_version",Date.now()); }
+  const done=(keys.indexOf(last)+1)>=keys.length;
+  await fbPut("pipeline/pdfCursor", done?"":last);
+  return { mode:"pdf", total:keys.length, scanned, skipped, withItems,
+           patched:Object.keys(patch).length, done, ms:Date.now()-t0 };
+}
+
 const PLACEHOLDER = "Medical / healthcare procurement — Kuwait (CTC)";
 
 export default async (req) => {
@@ -74,6 +204,15 @@ export default async (req) => {
     const u = new URL(req.url);
     const limit = Math.min(Number(u.searchParams.get("limit")) || 1500, 5000);
     if (u.searchParams.get("reset")) await fbPut("pipeline/backfillCursor", "");
+
+    if (u.searchParams.get("pdf")) {
+      if (!process.env.CTC_USER || !process.env.CTC_PASS)
+        return new Response(JSON.stringify({ ok:false, error:"Missing CTC_USER / CTC_PASS" }), { status:500, headers:{ "Content-Type":"application/json" } });
+      if (u.searchParams.get("reset")) await fbPut("pipeline/pdfCursor", "");
+      const res = await runPdfPass(Math.min(Number(u.searchParams.get("limit")) || 25, 60), t0);
+      console.log("[ctc-backfill]", JSON.stringify(res));
+      return new Response(JSON.stringify({ ok:true, ...res }), { headers:{ "Content-Type":"application/json" } });
+    }
 
     const all  = (await fbGet("tenders")) || {};
     const keys = Object.keys(all).sort();
