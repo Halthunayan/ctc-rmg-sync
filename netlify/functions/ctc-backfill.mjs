@@ -71,7 +71,6 @@ function describeTender(r, items = []) {
 // reading each tender's attachment. Bounded per invocation and resumable via
 // its own cursor, so it is re-invoked until {"done":true}. Kept separate from
 // the description backfill because it needs a CTC session and is far slower.
-import zlib from "node:zlib";
 const UA = "Mozilla/5.0 (compatible; RMG-CTC-Sync/1.0)";
 const CTC_T = 8000;
 
@@ -104,23 +103,19 @@ async function ctcLogin(j){
   return true;
 }
 
-function pdfText(buf){
-  let out=""; const bytes=Buffer.from(buf); let i=0;
-  while(true){
-    const st=bytes.indexOf("stream",i); if(st<0) break;
-    let a=st+6; if(bytes[a]===13)a++; if(bytes[a]===10)a++;
-    const e=bytes.indexOf("endstream",a); if(e<0) break;
-    i=e+9;
-    let chunk=bytes.subarray(a,e);
-    try{ chunk=zlib.inflateSync(chunk); }catch{ continue; }
-    const txt=chunk.toString("latin1");
-    const re=/\((?:\\.|[^\\()])*\)/g; let m, seg="";
-    while((m=re.exec(txt))) seg += m[0].slice(1,-1).replace(/\\([()\\])/g,"$1").replace(/\\[rn]/g," ");
-    if(seg.trim()) out += seg + "\n";
-    if(out.length>60000) break;
-  }
-  return out;
+// Text extraction uses unpdf (serverless pdf.js build). A hand-rolled
+// zlib+regex extractor was tried first and PROVEN WRONG against a real CTC
+// file: it returned 68k chars of metadata garbage ("ar-KWar-SA", null bytes)
+// where poppler returned 491k chars of real Arabic. It cannot decode CID /
+// Identity-H font encodings, which is exactly what these PDFs use.
+// Measured: 219-page CTC PDF -> 233,628 chars in 732 ms.
+async function pdfTextOf(buf){
+  const { extractText, getDocumentProxy } = await import("unpdf");
+  const pdf = await getDocumentProxy(new Uint8Array(buf));
+  const { text } = await extractText(pdf, { mergePages: true });
+  return String(text || "");
 }
+
 function pdfItems(text){
   const UNIT=/\b(PCS|BOX|VIAL|PKT|SET|EACH|KIT|AMP|TAB|BTL|PACK|ROLL|BAG|TUBE)\b/i;
   const items=[];
@@ -153,7 +148,7 @@ async function pdfForTender(j,id,ref){
       if(!pr.ok) continue;
       const buf=await pr.arrayBuffer();
       if(buf.byteLength>6e6) continue;
-      const items=pdfItems(pdfText(buf));
+      const items=pdfItems(await pdfTextOf(buf));
       if(items.length) return items;
     }catch{}
   }
