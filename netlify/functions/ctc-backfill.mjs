@@ -349,11 +349,14 @@ export default async (req) => {
           if (pr.ok) {
             const buf = await pr.arrayBuffer();
             rec.bytes = buf.byteLength;
+            // pdf.js detaches the ArrayBuffer it is given, so keep a copy for the
+            // second parse below.
+            const copy = buf.slice(0);
             if (buf.byteLength <= 6e6) {
               const txt = await pdfTextOf(buf);
               rec.textLen = txt.length;
               rec.sample = txt.slice(0, Math.min(Number(u.searchParams.get("sample")) || 400, 40000));
-              const it = await pdfItemsOf(buf);
+              const it = await pdfItemsOf(copy);
               rec.itemCount = it.length;
               rec.items = it.slice(0, 5);
             } else rec.note = "over 6MB cap — skipped by the real pass too";
