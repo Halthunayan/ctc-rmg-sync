@@ -203,13 +203,13 @@ function describeTender(r, d = {}, items = []){
 async function pdfPass(j, id, ref){
   const r = await get(j, `https://www.ctckw.com/TenderDetails.aspx?tdc_id=${id}`);
   const html = await r.text();
-  const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf)["']/gi)].map(m => m[1]);
+  const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf(?:\?[^"']*)?)["']/gi)].map(m => m[1]);
   if (!hrefs.length) return [];
   const key = String(ref || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
   const score = (h) => {
     const f = h.split("/").pop().replace(/[^A-Za-z0-9]/g, "").toUpperCase();
     if (key && f.includes(key)) return 0;          // ref-named → best
-    if (/DOC\d+\.PDF$/i.test(h)) return 2;         // generic batch advert → worst
+    if (/DOC\d+\.PDF(?:\?|$)/i.test(h)) return 2;         // generic batch advert → worst
     return 1;
   };
   hrefs.sort((a, b) => score(a) - score(b));
