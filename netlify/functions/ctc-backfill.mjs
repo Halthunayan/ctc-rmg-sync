@@ -308,6 +308,39 @@ export default async (req) => {
     const u = new URL(req.url);
     const limit = Math.min(Number(u.searchParams.get("limit")) || 1500, 5000);
 
+    // ?stats=1 — READ-ONLY. Status/type histogram for /tenders, plus how many
+    // records the active filter actually keeps. Answers "how many tenders are
+    // really open", which was previously guessed from an app KPI card that
+    // spans a different, much larger store.
+    if (u.searchParams.get("stats")) {
+      const all = (await fbGet("tenders")) || {};
+      const keys = Object.keys(all);
+      const byStatus = {}, byType = {};
+      let withItems = 0, open = 0, openNoItems = 0, future = 0;
+      const today = new Date().toISOString().slice(0, 10);
+      const norm = (d) => { const x = String(d || "").trim();
+        const m = x.match(/^(\d{4})[\/-](\d{2})[\/-](\d{2})/); if (m) return m[1] + "-" + m[2] + "-" + m[3];
+        const m2 = x.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})/); if (m2) return m2[3] + "-" + m2[2] + "-" + m2[1];
+        return ""; };
+      for (const k of keys) {
+        const t = all[k] || {};
+        const st = String(t.status || "(none)");
+        byStatus[st] = (byStatus[st] || 0) + 1;
+        const ty = String(t.type || "(none)");
+        byType[ty] = (byType[ty] || 0) + 1;
+        const has = Array.isArray(t.items) && t.items.length > 0;
+        if (has) withItems++;
+        const isOpen = OPEN_STATUS.test(st);
+        if (isOpen) { open++; if (!has) openNoItems++; }
+        const nd = norm(t.deadline);
+        if (nd && nd >= today) future++;
+      }
+      return new Response(JSON.stringify({ ok:true, mode:"stats", total:keys.length,
+        open, openNoItems, futureDeadline:future, withItems, byStatus, byType,
+        deadlineSamples: keys.slice(0, 3).map(k => (all[k] || {}).deadline),
+        ms:Date.now()-t0 }), { headers:{ "Content-Type":"application/json" } });
+    }
+
     // ?probe=<refId|nashraaId> — READ-ONLY diagnostic. Proves the extraction
     // path end-to-end for ONE tender: which PDFs the detail page exposes, which
     // one the scorer picks, how many characters unpdf recovers, and how many
