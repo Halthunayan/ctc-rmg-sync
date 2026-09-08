@@ -114,7 +114,11 @@ async function enrich(j,id){
 const MED = /طب|صحة|صحي|مستشفى|مستوصف|مركز صحي|رعاية صحية|عيادة|طبي|طبية|الطب|أسنان|صيدل|دواء|أدوية|محاليل مخبرية|مستهلكات طبية|أشعة|جراح|مرضى|تمريض|سريري|اكلينيكي|طوارئ طبية|إسعاف|وزارة الصحة|الصحة العامة|مجمع صحي|مرفق صحي|مجمع طبي|مرفق طبي|اورام|أورام|الطب النفسي|مختبر|مختبرات/;
 const NOTMED = /بيطر|البطاريات|الإطارات|التربة|الخرسانة|مواد البناء|عطور|تجميل|مأكولات|كافتيريا|بقالة/;
 const typeEN = (a)=>({ "ممارسة":"Practice","مناقصة":"Tender","مزايدة":"Auction","مزاد":"Auction","استدراج عروض":"RFQ","خدمات استشارية":"Consulting","تأهيل":"Prequalification","استثمار":"Investment" }[String(a).trim()]||a||"Practice");
-const statusEN = (s)=>({ "جديد":"New","ساري":"Open","ساري المفعول":"Open","قائم":"Open","منتهي":"Closed","مغلق":"Closed","مقفل":"Closed","ملغي":"Cancelled","ملغى":"Cancelled","معلق":"On Hold","مؤجل":"Postponed","تحت الدراسة":"Under Review" }[String(s).trim()]||(s||"New"));
+const statusEN = (s)=>({ "جديد":"New","ساري":"Open","ساري المفعول":"Open","قائم":"Open","منتهي":"Closed","مغلق":"Closed","مقفل":"Closed","ملغي":"Cancelled","ملغى":"Cancelled","معلق":"On Hold","مؤجل":"Postponed","تحت الدراسة":"Under Review","تعديل":"Amended","تمديد":"Extended","مُرسى":"Awarded","مرسى":"Awarded" }[String(s).trim()]||(s||"New"));
+// Unmapped Arabic values still pass through raw. That is deliberate — losing the
+// original string would hide a new CTC status entirely — but it means status
+// alone can never be trusted as a filter. closeOutExpired() below is what makes
+// the field meaningful.
 
 
 // ---- PDF text extraction (unpdf) -------------------------------------------
@@ -556,6 +560,33 @@ export default async (req) => {
       log.push("refreshed "+refreshed);
       console.log("[ctc-sync] deadline/status refresh:", refreshed, "updated");
     } catch(e) { console.log("[ctc-sync] refresh skipped:", String(e)); }
+
+    // STATUS CLOSE-OUT — measured 8 Sep 2026: CTC keeps reporting "جديد" long after
+    // a tender closes, so /tenders held status "New" for 1,357 of 1,358 records and
+    // every status-based filter, here and in the app, was meaningless. The refresh
+    // above only covers the ~200 most recent per category, so older records were
+    // never revised at all. The deadline is authoritative: anything past it cannot
+    // be bid on. Firebase-only — no CTC fetch — so this costs one read and one
+    // patch, and after the first run it only touches newly expired records.
+    try {
+      const allT = (await fbGet("tenders")) || {};
+      const today = new Date().toISOString().slice(0, 10);
+      const closePatch = {};
+      for (const k of Object.keys(allT)) {
+        const t = allT[k] || {};
+        const d = String(t.deadline || "").slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;   // unparsable — leave alone
+        if (d >= today) continue;                        // still biddable
+        if (/^(Closed|Cancelled|Awarded)$/i.test(String(t.status || ""))) continue;
+        closePatch[k + "/status"] = "Closed";
+      }
+      if (Object.keys(closePatch).length) {
+        await fbPatch("tenders", closePatch);
+        await fbPut("tenders_version", Date.now());
+      }
+      log.push("closed " + Object.keys(closePatch).length);
+      console.log("[ctc-sync] close-out:", Object.keys(closePatch).length, "expired -> Closed");
+    } catch (e) { console.log("[ctc-sync] close-out skipped:", String(e)); }
 
     // best-effort enrichment (refId/price/bond) — runs AFTER write+email so it can
     // NEVER stall the pipeline. Each TenderDetails fetch is raced against a 3.5s
