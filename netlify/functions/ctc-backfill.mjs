@@ -208,7 +208,13 @@ function pdfItems(text){
   const back = (end, count) => { const a = []; for (let i = end - 1; i >= 0 && a.length < count; i--) if (L[i]) a.unshift(L[i]); return a; };
   const units = back(iUnit, n), qtys = back(iQty, n);
   if (units.length !== n || qtys.length !== n) return [];
-  const dl = L.slice(iSl + 1, iDesc).filter(Boolean);
+  // Multi-page QOT forms repeat the CTC/MoH letterhead inside the stream, so
+  // the description block can contain the fax/phone/P.O.-box lines. Those once
+  // reached a live record as a product line. Drop boilerplate, and require a
+  // run of Latin letters: item descriptions on these forms are always English.
+  const NOISE = /(PRINTED ON|MINISTRY OF HEALTH|BIOMEDICAL|Page \d+ of \d+|P\.O\.\s?Box|SAFAT|Code No|Tel\s*:|Fax\s*:|QOT_|www\.|@)/i;
+  const dl = L.slice(iSl + 1, iDesc)
+    .filter(Boolean).filter(x => !NOISE.test(x)).filter(x => /[A-Za-z]{3}/.test(x));
   let descs;
   if (dl.length === n) descs = dl;
   else if (dl.length && dl.length % n === 0) { const k = dl.length / n; descs = []; for (let i=0;i<n;i++) descs.push(dl.slice(i*k,(i+1)*k).join(" ")); }
@@ -276,10 +282,11 @@ function isBiddable(t){
   if (nd) return nd >= new Date().toISOString().slice(0, 10);
   return OPEN_STATUS.test(String((t && t.status) || ""));
 }
-async function runPdfPass(limit, t0, activeOnly){
+async function runPdfPass(limit, t0, activeOnly, repair){
   const all=(await fbGet("tenders"))||{};
   const keys=Object.keys(all).sort();
-  const cursor=String((await fbGet("pipeline/pdfCursor"))||"");
+  const CUR = repair ? "pipeline/repairCursor" : "pipeline/pdfCursor";
+  const cursor=String((await fbGet(CUR))||"");
   let start=0; if(cursor){ const i=keys.indexOf(cursor); start=i>=0?i+1:0; }
 
   const j=jar(); await ctcLogin(j);
@@ -290,7 +297,10 @@ async function runPdfPass(limit, t0, activeOnly){
     if(budget()<3000) break;
     const k=keys[i], t=all[k]||{};
     last=k;
-    if(Array.isArray(t.items)&&t.items.length){ skipped++; continue; }
+    const hasItems = Array.isArray(t.items) && t.items.length > 0;
+    // repair mode inverts the filter: only records that already carry items are
+    // re-parsed, so a bad parse can be corrected without rescanning the corpus.
+    if(repair ? !hasItems : hasItems){ skipped++; continue; }
     // active-only mode: skip closed/cancelled tenders — they cannot be bid on,
     // and scanning them burns the whole budget for no operational value.
     if(activeOnly && !isBiddable(t)){ skipped++; continue; }
@@ -299,7 +309,14 @@ async function runPdfPass(limit, t0, activeOnly){
       pdfForTender(j,t._ctcId,t.refId).catch(()=>[]),
       new Promise(r=>setTimeout(()=>r([]),6000)),
     ]);
-    if(!items.length) continue;
+    if(!items.length){
+      if(repair){ // the old parse was wrong and nothing valid replaces it
+        patch[k+"/items"]=null; patch[k+"/itemCount"]=0;
+        patch[k+"/description"]=describeTender({title:t.summary,type:t.type,
+          entity:String(t.publisher||"").replace("Ministry of Health - ","")},[]);
+      }
+      continue;
+    }
     withItems++;
     patch[k+"/items"]=items;
     patch[k+"/itemCount"]=items.length;
@@ -309,8 +326,8 @@ async function runPdfPass(limit, t0, activeOnly){
   }
   if(Object.keys(patch).length){ await fbPatch("tenders",patch); await fbPut("tenders_version",Date.now()); }
   const done=(keys.indexOf(last)+1)>=keys.length;
-  await fbPut("pipeline/pdfCursor", done?"":last);
-  return { mode: activeOnly ? "pdf-active" : "pdf", total:keys.length, scanned, skipped, withItems,
+  await fbPut(CUR, done?"":last);
+  return { mode: repair ? "pdf-repair" : (activeOnly ? "pdf-active" : "pdf"), total:keys.length, scanned, skipped, withItems,
            patched:Object.keys(patch).length, done, ms:Date.now()-t0 };
 }
 
@@ -428,8 +445,9 @@ export default async (req) => {
     if (u.searchParams.get("pdf")) {
       if (!process.env.CTC_USER || !process.env.CTC_PASS)
         return new Response(JSON.stringify({ ok:false, error:"Missing CTC_USER / CTC_PASS" }), { status:500, headers:{ "Content-Type":"application/json" } });
-      if (u.searchParams.get("reset")) await fbPut("pipeline/pdfCursor", "");
-      const res = await runPdfPass(Math.min(Number(u.searchParams.get("limit")) || 3, 10), t0, !!u.searchParams.get("active"));
+      const repair = !!u.searchParams.get("repair");
+      if (u.searchParams.get("reset")) await fbPut(repair ? "pipeline/repairCursor" : "pipeline/pdfCursor", "");
+      const res = await runPdfPass(Math.min(Number(u.searchParams.get("limit")) || 3, 10), t0, !!u.searchParams.get("active"), repair);
       console.log("[ctc-backfill]", JSON.stringify(res));
       return new Response(JSON.stringify({ ok:true, ...res }), { headers:{ "Content-Type":"application/json" } });
     }
