@@ -155,7 +155,11 @@ async function pdfForTender(j,id,ref){
   return [];
 }
 
-async function runPdfPass(limit, t0){
+// Netlify synchronous functions cap around 10s. Measured cost is ~2s to log in
+// plus ~2s per tender, so only a handful fit per invocation — hence the small
+// default limit and the tight budget guard below.
+const OPEN_STATUS = /^(Open|New|Under Review|On Hold|Postponed)$/i;
+async function runPdfPass(limit, t0, activeOnly){
   const all=(await fbGet("tenders"))||{};
   const keys=Object.keys(all).sort();
   const cursor=String((await fbGet("pipeline/pdfCursor"))||"");
@@ -164,12 +168,15 @@ async function runPdfPass(limit, t0){
   const j=jar(); await ctcLogin(j);
 
   const patch={}; let scanned=0, withItems=0, skipped=0, last=cursor;
-  const budget=()=> 22000-(Date.now()-t0);          // stay well inside the timeout
+  const budget=()=> 8500-(Date.now()-t0);           // Netlify sync limit is ~10s
   for(let i=start;i<keys.length&&scanned<limit;i++){
-    if(budget()<6000) break;
+    if(budget()<3000) break;
     const k=keys[i], t=all[k]||{};
     last=k;
     if(Array.isArray(t.items)&&t.items.length){ skipped++; continue; }
+    // active-only mode: skip closed/cancelled tenders — they cannot be bid on,
+    // and scanning them burns the whole budget for no operational value.
+    if(activeOnly && !OPEN_STATUS.test(String(t.status||""))){ skipped++; continue; }
     scanned++;
     const items=await Promise.race([
       pdfForTender(j,t._ctcId,t.refId).catch(()=>[]),
@@ -186,7 +193,7 @@ async function runPdfPass(limit, t0){
   if(Object.keys(patch).length){ await fbPatch("tenders",patch); await fbPut("tenders_version",Date.now()); }
   const done=(keys.indexOf(last)+1)>=keys.length;
   await fbPut("pipeline/pdfCursor", done?"":last);
-  return { mode:"pdf", total:keys.length, scanned, skipped, withItems,
+  return { mode: activeOnly ? "pdf-active" : "pdf", total:keys.length, scanned, skipped, withItems,
            patched:Object.keys(patch).length, done, ms:Date.now()-t0 };
 }
 
@@ -198,16 +205,69 @@ export default async (req) => {
     if (!FB) return new Response(JSON.stringify({ ok:false, error:"Missing FIREBASE_URL" }), { status:500, headers:{ "Content-Type":"application/json" } });
     const u = new URL(req.url);
     const limit = Math.min(Number(u.searchParams.get("limit")) || 1500, 5000);
-    if (u.searchParams.get("reset")) await fbPut("pipeline/backfillCursor", "");
+
+    // ?probe=<refId|nashraaId> — READ-ONLY diagnostic. Proves the extraction
+    // path end-to-end for ONE tender: which PDFs the detail page exposes, which
+    // one the scorer picks, how many characters unpdf recovers, and how many
+    // items the parser finds. Writes nothing to Firebase and touches no cursor.
+    const probe = u.searchParams.get("probe");
+    if (probe) {
+      if (!process.env.CTC_USER || !process.env.CTC_PASS)
+        return new Response(JSON.stringify({ ok:false, error:"Missing CTC_USER / CTC_PASS" }), { status:500, headers:{ "Content-Type":"application/json" } });
+      const all = (await fbGet("tenders")) || {};
+      const norm = (x)=> String(x||"").replace(/[^A-Za-z0-9]/g,"").toUpperCase();
+      const want = norm(probe);
+      const k = Object.keys(all).find(x => norm(x)===want || norm((all[x]||{}).refId)===want);
+      if (!k) return new Response(JSON.stringify({ ok:false, mode:"probe", probe, error:"not found in /tenders", total:Object.keys(all).length }), { status:404, headers:{ "Content-Type":"application/json" } });
+      const t = all[k] || {};
+      const j = jar(); await ctcLogin(j);
+      const r = await cget(j, `https://www.ctckw.com/TenderDetails.aspx?tdc_id=${t._ctcId}`);
+      const html = await r.text();
+      const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf)["']/gi)].map(m=>m[1]);
+      const key = norm(t.refId);
+      const score = (h)=>{ const f = norm(h.split("/").pop());
+        if (key && f.includes(key)) return 0; if (/DOC\d+\.PDF$/i.test(h)) return 2; return 1; };
+      hrefs.sort((a,b)=>score(a)-score(b));
+      const tried = [];
+      for (const h of hrefs.slice(0,2)) {
+        const url = h.startsWith("http") ? h : `https://www.ctckw.com/${h.replace(/^\/+/,"")}`;
+        const rec = { href:h, score:score(h) };
+        try {
+          const pr = await fetchT(url, { headers:{ Cookie:j.hdr(), "User-Agent":UA } }, 5000);
+          rec.httpStatus = pr.status;
+          if (pr.ok) {
+            const buf = await pr.arrayBuffer();
+            rec.bytes = buf.byteLength;
+            if (buf.byteLength <= 6e6) {
+              const txt = await pdfTextOf(buf);
+              rec.textLen = txt.length;
+              rec.sample = txt.slice(0, 400);
+              const it = pdfItems(txt);
+              rec.itemCount = it.length;
+              rec.items = it.slice(0, 5);
+            } else rec.note = "over 6MB cap — skipped by the real pass too";
+          }
+        } catch (e) { rec.error = String((e && e.message) || e); }
+        tried.push(rec);
+        if (Date.now() - t0 > 8000) { rec.aborted = "budget"; break; }
+      }
+      return new Response(JSON.stringify({ ok:true, mode:"probe", key, refId:t.refId, ctcId:t._ctcId,
+        status:t.status, hasItems:Array.isArray(t.items)?t.items.length:0, pdfHrefs:hrefs.length,
+        tried, ms:Date.now()-t0 }), { headers:{ "Content-Type":"application/json" } });
+    }
 
     if (u.searchParams.get("pdf")) {
       if (!process.env.CTC_USER || !process.env.CTC_PASS)
         return new Response(JSON.stringify({ ok:false, error:"Missing CTC_USER / CTC_PASS" }), { status:500, headers:{ "Content-Type":"application/json" } });
       if (u.searchParams.get("reset")) await fbPut("pipeline/pdfCursor", "");
-      const res = await runPdfPass(Math.min(Number(u.searchParams.get("limit")) || 25, 60), t0);
+      const res = await runPdfPass(Math.min(Number(u.searchParams.get("limit")) || 3, 10), t0, !!u.searchParams.get("active"));
       console.log("[ctc-backfill]", JSON.stringify(res));
       return new Response(JSON.stringify({ ok:true, ...res }), { headers:{ "Content-Type":"application/json" } });
     }
+
+    // reset applies ONLY to this mode's cursor. It previously ran BEFORE the pdf
+    // branch, so `?pdf=1&reset=1` silently wiped the description cursor as well.
+    if (u.searchParams.get("reset")) await fbPut("pipeline/backfillCursor", "");
 
     const all  = (await fbGet("tenders")) || {};
     const keys = Object.keys(all).sort();
