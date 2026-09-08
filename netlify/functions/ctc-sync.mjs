@@ -134,6 +134,12 @@ async function pdfTextOf(buf){
   return String(text || "");
 }
 
+// Letterhead/boilerplate that must never become a product description. The
+// CTC/MoH QOT form repeats its header on every page, and both parsers have
+// picked it up as a line item at least once on live data.
+const DESC_NOISE = /(PRINTED ON|MINISTRY OF HEALTH|BIOMEDICAL|Page \d+ of \d+|P\.O\.\s?Box|SAFAT|Code No|Tel\s*:|Fax\s*:|QOT_|www\.|@)/i;
+const looksLikeDesc = (d) => /[A-Za-z]{3}/.test(String(d || "")) && !DESC_NOISE.test(String(d || ""));
+
 function numOf(s){
   const m = String(s).replace(/[^\d,]/g,"").match(/^\d{1,3}(?:,\d{3})+|^\d+/);
   if(!m) return null;
@@ -205,7 +211,7 @@ async function positionalItems(pdf){
     }
     if (cur && cur.d) out.push(cur);
   }
-  return out.filter(i => i.d && i.d.length >= 4 && i.q > 0)
+  return out.filter(i => i.d && i.d.length >= 4 && i.q > 0 && looksLikeDesc(i.d))
             .map(i => ({ d: i.d.slice(0,160), u: i.u.slice(0,12), q: i.q }))
             .slice(0, 40);
 }
@@ -230,9 +236,7 @@ function pdfItems(text){
   // the description block can contain the fax/phone/P.O.-box lines. Those once
   // reached a live record as a product line. Drop boilerplate, and require a
   // run of Latin letters: item descriptions on these forms are always English.
-  const NOISE = /(PRINTED ON|MINISTRY OF HEALTH|BIOMEDICAL|Page \d+ of \d+|P\.O\.\s?Box|SAFAT|Code No|Tel\s*:|Fax\s*:|QOT_|www\.|@)/i;
-  const dl = L.slice(iSl + 1, iDesc)
-    .filter(Boolean).filter(x => !NOISE.test(x)).filter(x => /[A-Za-z]{3}/.test(x));
+  const dl = L.slice(iSl + 1, iDesc).filter(Boolean).filter(looksLikeDesc);
   let descs;
   if (dl.length === n) descs = dl;
   else if (dl.length && dl.length % n === 0) { const k = dl.length / n; descs = []; for (let i=0;i<n;i++) descs.push(dl.slice(i*k,(i+1)*k).join(" ")); }
