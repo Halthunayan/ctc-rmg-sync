@@ -581,7 +581,11 @@ export default async (req) => {
     // CTC attachment can never prevent the pipeline from writing or emailing —
     // that failure mode stalled this pipeline for a week and must not return.
     if (records.length) {
-      const PDF_CAP = 8, PDF_CONC = 2, patch = {};
+      // Raised from 8: the budgetLeft() guard below already bounds this pass, so
+      // the cap only needs to stop a heavy day from starving the budget. Anything
+      // still unscanned is picked up by ctc-backfill, which skips records already
+      // marked itemsTried.
+      const PDF_CAP = 15, PDF_CONC = 2, patch = {};
       const budgetLeft = () => 45000 - (Date.now() - t0);     // leave ~15s headroom
       const racePdf = (id, ref) => Promise.race([
         pdfPass(j, id, ref).catch(() => []),
@@ -594,7 +598,12 @@ export default async (req) => {
         const res = await Promise.all(cap.slice(i, i + PDF_CONC).map(async t => ({ t, items: await racePdf(t._ctcId, t.refId) })));
         res.forEach(({ t, items }) => {
           scanned++;
-          if (!items.length) return;
+          if (!items.length) {
+            // Tell ctc-backfill this one was already attempted, so its active pass
+            // does not pay to scan it again.
+            patch[t.nashraaId + "/itemsTried"] = new Date().toISOString().slice(0, 10);
+            return;
+          }
           withItems++;
           patch[t.nashraaId + "/items"]       = items;
           patch[t.nashraaId + "/itemCount"]   = items.length;
