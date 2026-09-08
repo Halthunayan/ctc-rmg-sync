@@ -224,6 +224,15 @@ export default async (req) => {
       const r = await cget(j, `https://www.ctckw.com/TenderDetails.aspx?tdc_id=${t._ctcId}`);
       const html = await r.text();
       const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf)["']/gi)].map(m=>m[1]);
+      const dbg = {
+        htmlLen: html.length,
+        pageHasLoginForm: /txtPinCode2/i.test(html),
+        pdfMentions: (html.match(/\.pdf/gi) || []).length,
+        dataFilesMentions: (html.match(/DataFiles/gi) || []).length,
+        titleTag: ((html.match(/<title[^>]*>([\s\S]{0,120})<\/title>/i) || [])[1] || "").trim(),
+        anchorSample: [...html.matchAll(/href\s*=\s*["']([^"']{1,200})["']/gi)]
+          .map(m => m[1]).filter(x => !/^(#|javascript:)/i.test(x)).slice(0, 25),
+      };
       const key = norm(t.refId);
       const score = (h)=>{ const f = norm(h.split("/").pop());
         if (key && f.includes(key)) return 0; if (/DOC\d+\.PDF$/i.test(h)) return 2; return 1; };
@@ -253,7 +262,7 @@ export default async (req) => {
       }
       return new Response(JSON.stringify({ ok:true, mode:"probe", key, refId:t.refId, ctcId:t._ctcId,
         status:t.status, hasItems:Array.isArray(t.items)?t.items.length:0, pdfHrefs:hrefs.length,
-        tried, ms:Date.now()-t0 }), { headers:{ "Content-Type":"application/json" } });
+        dbg, tried, ms:Date.now()-t0 }), { headers:{ "Content-Type":"application/json" } });
     }
 
     if (u.searchParams.get("pdf")) {
