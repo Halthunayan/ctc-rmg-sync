@@ -261,6 +261,21 @@ async function pdfForTender(j,id,ref){
 // plus ~2s per tender, so only a handful fit per invocation — hence the small
 // default limit and the tight budget guard below.
 const OPEN_STATUS = /^(Open|New|Under Review|On Hold|Postponed)$/i;
+// Measured 2026-09-08: ctc-sync writes status "New" for 1,357 of 1,358 records
+// and never revises it, so a status-only filter keeps everything. The deadline
+// is the only usable signal for "still biddable" (267 of 1,358). Status is
+// retained only as a fallback when a record carries no parsable deadline.
+function normDate(d){
+  const x = String(d || "").trim();
+  const a = x.match(/^(\d{4})[\/-](\d{2})[\/-](\d{2})/); if (a) return a[1]+"-"+a[2]+"-"+a[3];
+  const b = x.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})/); if (b) return b[3]+"-"+b[2]+"-"+b[1];
+  return "";
+}
+function isBiddable(t){
+  const nd = normDate(t && t.deadline);
+  if (nd) return nd >= new Date().toISOString().slice(0, 10);
+  return OPEN_STATUS.test(String((t && t.status) || ""));
+}
 async function runPdfPass(limit, t0, activeOnly){
   const all=(await fbGet("tenders"))||{};
   const keys=Object.keys(all).sort();
@@ -278,7 +293,7 @@ async function runPdfPass(limit, t0, activeOnly){
     if(Array.isArray(t.items)&&t.items.length){ skipped++; continue; }
     // active-only mode: skip closed/cancelled tenders — they cannot be bid on,
     // and scanning them burns the whole budget for no operational value.
-    if(activeOnly && !OPEN_STATUS.test(String(t.status||""))){ skipped++; continue; }
+    if(activeOnly && !isBiddable(t)){ skipped++; continue; }
     scanned++;
     const items=await Promise.race([
       pdfForTender(j,t._ctcId,t.refId).catch(()=>[]),
