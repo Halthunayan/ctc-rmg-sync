@@ -226,7 +226,13 @@ function pdfItems(text){
   const back = (end, count) => { const a = []; for (let i = end - 1; i >= 0 && a.length < count; i--) if (L[i]) a.unshift(L[i]); return a; };
   const units = back(iUnit, n), qtys = back(iQty, n);
   if (units.length !== n || qtys.length !== n) return [];
-  const dl = L.slice(iSl + 1, iDesc).filter(Boolean);
+  // Multi-page QOT forms repeat the CTC/MoH letterhead inside the stream, so
+  // the description block can contain the fax/phone/P.O.-box lines. Those once
+  // reached a live record as a product line. Drop boilerplate, and require a
+  // run of Latin letters: item descriptions on these forms are always English.
+  const NOISE = /(PRINTED ON|MINISTRY OF HEALTH|BIOMEDICAL|Page \d+ of \d+|P\.O\.\s?Box|SAFAT|Code No|Tel\s*:|Fax\s*:|QOT_|www\.|@)/i;
+  const dl = L.slice(iSl + 1, iDesc)
+    .filter(Boolean).filter(x => !NOISE.test(x)).filter(x => /[A-Za-z]{3}/.test(x));
   let descs;
   if (dl.length === n) descs = dl;
   else if (dl.length && dl.length % n === 0) { const k = dl.length / n; descs = []; for (let i=0;i<n;i++) descs.push(dl.slice(i*k,(i+1)*k).join(" ")); }
