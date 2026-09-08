@@ -135,11 +135,11 @@ function pdfItems(text){
 async function pdfForTender(j,id,ref){
   const r = await cget(j,`https://www.ctckw.com/TenderDetails.aspx?tdc_id=${id}`);
   const html = await r.text();
-  const hrefs=[...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf)["']/gi)].map(m=>m[1]);
+  const hrefs=[...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf(?:\?[^"']*)?)["']/gi)].map(m=>m[1]);
   if(!hrefs.length) return [];
   const key=String(ref||"").replace(/[^A-Za-z0-9]/g,"").toUpperCase();
   const score=(h)=>{ const f=h.split("/").pop().replace(/[^A-Za-z0-9]/g,"").toUpperCase();
-    if(key&&f.includes(key)) return 0; if(/DOC\d+\.PDF$/i.test(h)) return 2; return 1; };
+    if(key&&f.includes(key)) return 0; if(/DOC\d+\.PDF(?:\?|$)/i.test(h)) return 2; return 1; };
   hrefs.sort((a,b)=>score(a)-score(b));
   for(const h of hrefs.slice(0,2)){
     const url=h.startsWith("http")?h:`https://www.ctckw.com/${h.replace(/^\/+/,"")}`;
@@ -223,7 +223,7 @@ export default async (req) => {
       const j = jar(); await ctcLogin(j);
       const r = await cget(j, `https://www.ctckw.com/TenderDetails.aspx?tdc_id=${t._ctcId}`);
       const html = await r.text();
-      const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf)["']/gi)].map(m=>m[1]);
+      const hrefs = [...html.matchAll(/href\s*=\s*["']([^"']*DataFiles[^"']*\.pdf(?:\?[^"']*)?)["']/gi)].map(m=>m[1]);
       const dbg = {
         htmlLen: html.length,
         pageHasLoginForm: /txtPinCode2/i.test(html),
@@ -235,7 +235,7 @@ export default async (req) => {
       };
       const key = norm(t.refId);
       const score = (h)=>{ const f = norm(h.split("/").pop());
-        if (key && f.includes(key)) return 0; if (/DOC\d+\.PDF$/i.test(h)) return 2; return 1; };
+        if (key && f.includes(key)) return 0; if (/DOC\d+\.PDF(?:\?|$)/i.test(h)) return 2; return 1; };
       hrefs.sort((a,b)=>score(a)-score(b));
       const tried = [];
       for (const h of hrefs.slice(0,2)) {
