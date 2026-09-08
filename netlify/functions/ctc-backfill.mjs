@@ -332,6 +332,7 @@ export default async (req) => {
       const keys = Object.keys(all);
       const byStatus = {}, byType = {};
       let withItems = 0, open = 0, openNoItems = 0, future = 0;
+      const samples = [];
       const today = new Date().toISOString().slice(0, 10);
       const norm = (d) => { const x = String(d || "").trim();
         const m = x.match(/^(\d{4})[\/-](\d{2})[\/-](\d{2})/); if (m) return m[1] + "-" + m[2] + "-" + m[3];
@@ -344,7 +345,12 @@ export default async (req) => {
         const ty = String(t.type || "(none)");
         byType[ty] = (byType[ty] || 0) + 1;
         const has = Array.isArray(t.items) && t.items.length > 0;
-        if (has) withItems++;
+        if (has) { withItems++;
+          if (samples.length < 4) samples.push({ ref:t.refId, deadline:t.deadline,
+            itemCount:t.itemCount, subSector:t.subSector,
+            description:String(t.description || "").slice(0, 200),
+            items:(t.items || []).slice(0, 3) });
+        }
         const isOpen = OPEN_STATUS.test(st);
         if (isOpen) { open++; if (!has) openNoItems++; }
         const nd = norm(t.deadline);
@@ -353,6 +359,7 @@ export default async (req) => {
       return new Response(JSON.stringify({ ok:true, mode:"stats", total:keys.length,
         open, openNoItems, futureDeadline:future, withItems, byStatus, byType,
         deadlineSamples: keys.slice(0, 3).map(k => (all[k] || {}).deadline),
+        samples,
         ms:Date.now()-t0 }), { headers:{ "Content-Type":"application/json" } });
     }
 
