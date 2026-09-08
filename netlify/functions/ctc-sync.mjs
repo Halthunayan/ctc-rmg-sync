@@ -117,34 +117,21 @@ const typeEN = (a)=>({ "ممارسة":"Practice","مناقصة":"Tender","مزا
 const statusEN = (s)=>({ "جديد":"New","ساري":"Open","ساري المفعول":"Open","قائم":"Open","منتهي":"Closed","مغلق":"Closed","مقفل":"Closed","ملغي":"Cancelled","ملغى":"Cancelled","معلق":"On Hold","مؤجل":"Postponed","تحت الدراسة":"Under Review" }[String(s).trim()]||(s||"New"));
 
 
-// ---- PDF text extraction (no dependency: Node's built-in zlib) --------------
+// ---- PDF text extraction (unpdf) -------------------------------------------
 // CTC's MoH "QOT" quotation forms carry a real text layer. Content streams are
 // FlateDecode, so inflate each stream and pull the text-showing operators.
 // Deliberately NOT pdfjs-dist: a heavy import + parse would risk the 60s
 // function timeout that previously stalled this pipeline for a week.
-import zlib from "node:zlib";
-function pdfText(buf){
-  let out = "";
-  const bytes = Buffer.from(buf);
-  let i = 0;
-  while (true) {
-    const s = bytes.indexOf("stream", i); if (s < 0) break;
-    let a = s + 6; if (bytes[a] === 13) a++; if (bytes[a] === 10) a++;
-    const e = bytes.indexOf("endstream", a); if (e < 0) break;
-    i = e + 9;
-    let chunk = bytes.subarray(a, e);
-    try { chunk = zlib.inflateSync(chunk); } catch { continue; }   // not deflated → skip
-    const txt = chunk.toString("latin1");
-    // ( ... ) Tj   and   [ (..) -3 (..) ] TJ
-    const re = /\((?:\\.|[^\\()])*\)/g;
-    let m, seg = "";
-    while ((m = re.exec(txt))) {
-      seg += m[0].slice(1, -1).replace(/\\([()\\])/g, "$1").replace(/\\[rn]/g, " ");
-    }
-    if (seg.trim()) out += seg + "\n";
-    if (out.length > 60000) break;                                  // hard cap
-  }
-  return out;
+// Text extraction via unpdf (serverless pdf.js). The previous hand-rolled
+// zlib+regex extractor was PROVEN WRONG on a real CTC file: 68k chars of
+// metadata garbage vs poppler's 491k chars of real Arabic. It cannot decode
+// CID/Identity-H fonts, which these PDFs use. Measured: 219pp -> 233k chars
+// in ~700 ms.
+async function pdfTextOf(buf){
+  const { extractText, getDocumentProxy } = await import("unpdf");
+  const pdf = await getDocumentProxy(new Uint8Array(buf));
+  const { text } = await extractText(pdf, { mergePages: true });
+  return String(text || "");
 }
 
 // Parse an item schedule: English product line + unit + quantity.
@@ -233,7 +220,7 @@ async function pdfPass(j, id, ref){
       if (!pr.ok) continue;
       const buf = await pr.arrayBuffer();
       if (buf.byteLength > 6e6) continue;          // skip very large scans
-      const items = pdfItems(pdfText(buf));
+      const items = pdfItems(await pdfTextOf(buf));
       if (items.length) return items;
     } catch { /* ignore this attachment */ }
   }
@@ -502,7 +489,9 @@ export default async (req) => {
           withItems++;
           patch[t.nashraaId + "/items"]       = items;
           patch[t.nashraaId + "/itemCount"]   = items.length;
-          patch[t.nashraaId + "/description"] = describeTender({ title: t.summary }, {}, items);
+          patch[t.nashraaId + "/description"] = describeTender(
+            { title: t.summary, type: t.type,
+              entity: String(t.publisher || "").replace("Ministry of Health - ", "") }, {}, items);
           patch[t.nashraaId + "/subSector"]   = subSectorFor(t.summary, items);
         });
       }
