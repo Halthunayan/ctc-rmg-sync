@@ -134,23 +134,122 @@ async function pdfTextOf(buf){
   return String(text || "");
 }
 
-// Parse an item schedule: English product line + unit + quantity.
-function pdfItems(text){
-  const UNIT = /\b(PCS|BOX|VIAL|PKT|SET|EACH|KIT|AMP|TAB|BTL|PACK|ROLL|BAG|TUBE)\b/i;
-  const items = [];
-  for (const raw of text.split(/\n+/)) {
-    const line = raw.replace(/\s+/g, " ").trim();
-    if (line.length < 12) continue;
-    const u = line.match(UNIT); if (!u) continue;
-    const q = line.match(/\b(\d{1,3}(?:,\d{3})+|\d{2,7})\b(?!.*\b\d{2,7}\b)/);
-    if (!q) continue;
-    const qty = Number(q[1].replace(/,/g, ""));
-    if (!qty || qty < 2) continue;                                  // 1 = lot placeholder
-    const desc = line.slice(0, u.index).replace(/[|,;:\s]+$/, "").trim();
-    if (desc.length < 6) continue;
-    items.push({ d: desc.slice(0, 160), u: u[1].toUpperCase(), q: qty });
-    if (items.length >= 40) break;
+function numOf(s){
+  const m = String(s).replace(/[^\d,]/g,"").match(/^\d{1,3}(?:,\d{3})+|^\d+/);
+  if(!m) return null;
+  const n = Number(m[0].replace(/,/g,""));
+  return Number.isFinite(n) && n>0 ? n : null;
+}
+
+// Reconstruct real table rows from glyph coordinates. unpdf/pdf.js emits text
+// in content-stream order, not visual order, so on the MoH QOT form the
+// columns arrive as separate blocks and a line-based parse pairs the wrong
+// description with the wrong quantity (it once read the letterhead postcode
+// 13086 as a quantity). Coordinates are the only reliable pairing.
+async function positionalItems(pdf){
+  const out = [];
+  const pages = Math.min(pdf.numPages || 1, 12);
+  for (let p = 1; p <= pages && out.length < 40; p++) {
+    let tc;
+    try { tc = await (await pdf.getPage(p)).getTextContent(); } catch { continue; }
+    const glyphs = (tc.items || [])
+      .filter(i => i && typeof i.str === "string" && i.str.trim())
+      .map(i => ({ s: i.str.trim(), x: i.transform[4], y: i.transform[5] }))
+      .sort((a,b) => (b.y - a.y) || (a.x - b.x));
+    const rows = [];
+    for (const g of glyphs) {
+      const r = rows[rows.length-1];
+      if (r && Math.abs(r.y - g.y) <= 3) r.cells.push(g); else rows.push({ y:g.y, cells:[g] });
+    }
+    rows.forEach(r => r.cells.sort((a,b) => a.x - b.x));
+
+    let hi = -1, col = {};
+    for (let i = 0; i < rows.length; i++) {
+      const joined = rows[i].cells.map(c=>c.s).join(" ").toUpperCase();
+      if (!/DESCRIPTION/.test(joined) || !/QUANTITY/.test(joined)) continue;
+      hi = i; col = {};
+      for (const c of rows[i].cells) {
+        const u = c.s.toUpperCase();
+        if (/SL\s*N[O0]/.test(u))       col.sl   = c.x;
+        else if (/DESCRIPTION/.test(u)) col.desc = c.x;
+        else if (/^UNIT/.test(u))       col.unit = c.x;
+        else if (/QUANTITY/.test(u))    col.qty  = c.x;
+      }
+      break;
+    }
+    if (hi < 0 || col.desc == null || col.unit == null || col.qty == null) continue;
+
+    const pick = (cells, lo, hix) => cells.filter(c => c.x >= lo && c.x < hix).map(c=>c.s).join(" ").replace(/\s+/g," ").trim();
+    const bDesc = col.sl != null ? (col.sl + col.desc)/2 : col.desc - 20;
+    const bUnit = (col.desc + col.unit)/2;
+    const bQty  = (col.unit + col.qty)/2;
+    const right = col.qty + Math.max(40, col.qty - col.unit);
+
+    let cur = null;
+    for (let i = hi + 1; i < rows.length; i++) {
+      const cells = rows[i].cells;
+      const line  = cells.map(c=>c.s).join(" ");
+      if (/REMARKS|PLEASE QUOTE|F\.O\.B|CLOSING DATE|VALIDITY OF THE OFFER/i.test(line)) break;
+      const sl   = col.sl != null ? pick(cells, col.sl - 25, bDesc) : "";
+      const desc = pick(cells, bDesc, bUnit);
+      const unit = pick(cells, bUnit, bQty);
+      const qty  = numOf(pick(cells, bQty, right));
+      if (/^\d{1,3}$/.test(sl) || (qty && unit)) {
+        if (cur && cur.d) out.push(cur);
+        cur = { d: desc, u: (unit||"").toUpperCase(), q: qty || 0 };
+      } else if (cur && desc) {
+        cur.d = (cur.d + " " + desc).trim();
+      }
+      if (cur && qty && !cur.q) cur.q = qty;
+      if (cur && unit && !cur.u) cur.u = unit.toUpperCase();
+    }
+    if (cur && cur.d) out.push(cur);
   }
+  return out.filter(i => i.d && i.d.length >= 4 && i.q > 0)
+            .map(i => ({ d: i.d.slice(0,160), u: i.u.slice(0,12), q: i.q }))
+            .slice(0, 40);
+}
+
+// Text fallback. Uses the MoH QOT column-header anchors: the serial, unit and
+// quantity blocks each end with their header label and align exactly, so those
+// three are safe. Descriptions are only paired when the line count divides
+// evenly by the item count; otherwise nothing is emitted rather than guessed.
+function pdfItems(text){
+  const L = String(text||"").split(/\r?\n/).map(s => s.replace(/\s+/g," ").trim());
+  const at = (re) => L.findIndex(l => re.test(l));
+  const iSl = at(/^SL\s*N[O0]\.?$/i), iDesc = at(/^ITEM\s+DESCRIPTION$/i),
+        iUnit = at(/^UNIT$/i),        iQty  = at(/^QUANTITY$/i);
+  if (iSl < 0 || iDesc < 0 || iUnit < 0 || iQty < 0) return [];
+  const serials = [];
+  for (let i = iSl - 1; i >= 0 && /^\d{1,3}$/.test(L[i]); i--) serials.unshift(L[i]);
+  const n = serials.length; if (!n) return [];
+  const back = (end, count) => { const a = []; for (let i = end - 1; i >= 0 && a.length < count; i--) if (L[i]) a.unshift(L[i]); return a; };
+  const units = back(iUnit, n), qtys = back(iQty, n);
+  if (units.length !== n || qtys.length !== n) return [];
+  const dl = L.slice(iSl + 1, iDesc).filter(Boolean);
+  let descs;
+  if (dl.length === n) descs = dl;
+  else if (dl.length && dl.length % n === 0) { const k = dl.length / n; descs = []; for (let i=0;i<n;i++) descs.push(dl.slice(i*k,(i+1)*k).join(" ")); }
+  else if (n === 1) descs = [dl.join(" ")];
+  else return [];
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const q = numOf(qtys[i]), d = descs[i], u = String(units[i]||"").toUpperCase();
+    if (!q || !d || d.length < 4) continue;
+    out.push({ d: d.slice(0,160), u: u.slice(0,12), q });
+  }
+  return out.slice(0, 40);
+}
+
+// Primary path is the text-anchor parser above: it is verified correct against
+// a real MoH QOT form (6LB333 -> 400,000 + 4,000,000 PCS). positionalItems is
+// the fallback for attachments that lack those column headers.
+async function pdfItemsOf(buf){
+  const { extractText, getDocumentProxy } = await import("unpdf");
+  const pdf = await getDocumentProxy(new Uint8Array(buf));
+  let items = [];
+  try { const { text } = await extractText(pdf, { mergePages: true }); items = pdfItems(String(text || "")); } catch {}
+  if (!items.length) { try { items = await positionalItems(pdf); } catch {} }
   return items;
 }
 
@@ -220,7 +319,7 @@ async function pdfPass(j, id, ref){
       if (!pr.ok) continue;
       const buf = await pr.arrayBuffer();
       if (buf.byteLength > 6e6) continue;          // skip very large scans
-      const items = pdfItems(await pdfTextOf(buf));
+      const items = await pdfItemsOf(buf);
       if (items.length) return items;
     } catch { /* ignore this attachment */ }
   }
